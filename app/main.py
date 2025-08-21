@@ -1,7 +1,8 @@
 from fastapi import FastAPI
 
-app = FastAPI()
+akiliAi = FastAPI()
 
-@app.get("/ping")
-def ping():
+
+@akiliAi.get("/ping")
+def first_func():
     return {"message": "AI Engine Ready"}
