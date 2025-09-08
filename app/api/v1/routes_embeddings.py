@@ -1,4 +1,3 @@
-# app/api/v1/routes_embeddings.py
 from fastapi import APIRouter, HTTPException, Depends, Header
 from app.schemas.embedding import UpsertRequest, UpsertResponse
 from app.services.embeddings import EmbeddingServiceHuggingFace, EmbeddingServiceOpenai

@@ -1,4 +1,3 @@
-# app/core/config.py
 import os
 from dotenv import load_dotenv
 
@@ -24,6 +23,11 @@ class Settings:
     # Chunking Config
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
+
+    # Chat Configuration
+    MAX_HISTORY_LENGTH: int = 10
+    DEFAULT_SEARCH_LIMIT: int = 5
+    MIN_CONFIDENCE_THRESHOLD: float = 0.5
     
     
 

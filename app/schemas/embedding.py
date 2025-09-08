@@ -1,4 +1,3 @@
-# app/schemas/embedding.py
 from pydantic import BaseModel
 from typing import List, Dict, Any
 

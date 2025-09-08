@@ -1,4 +1,3 @@
-# app/services/embeddings.py
 from re import L
 from urllib import response
 import openai

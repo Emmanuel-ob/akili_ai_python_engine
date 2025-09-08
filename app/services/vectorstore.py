@@ -1,4 +1,3 @@
-# app/services/vectorstore.py
 import hashlib
 from typing import List, Dict, Any
 from venv import logger
@@ -73,3 +72,35 @@ class VectorStoreService:
         self.client.upsert(collection_name=collection_name, points=points)
 
         return len(points)
+    
+
+    def search_similar(
+        self, collection_name: str, query_vector: List[float], limit: int = 5
+    ):
+        """Search for similar documents in the vector database"""
+        try:
+            # Ensure collection exists
+            self.client.get_collection(collection_name)
+
+            # Unwrap if embedding is nested
+            if isinstance(query_vector[0], list):
+                query_vector = query_vector[0]
+
+            # Perform search
+            search_results = self.client.search(
+                collection_name=collection_name,
+                query_vector=query_vector,
+                limit=limit,
+                with_payload=True,
+            )
+
+            for res in search_results:
+                logger.info(
+                    f"Found doc_id={res.payload.get('doc_id')} score={res.score:.4f}"
+                )
+
+            return search_results
+
+        except Exception as e:
+            logger.error(f"Error searching vector database: {str(e)}")
+            return []
