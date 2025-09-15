@@ -40,13 +40,24 @@ class ChunkingService:
         chunked_docs = []
 
         for doc in documents:
-            text = doc['text']
-            print("text from chunking.py", text)
-            logger.info(f"Processing document {doc['doc_id']} with length {len(text)}")
+            text = doc["text"]
+            doc_id = doc.get("doc_id", "unknown")
+
+            # Debug logging
+            logger.info(f"Processing document {doc_id} with text length {len(text)}")
+            logger.info(f"Text preview: {text[:200]}...")
+
+            # Check for problematic text content
+            if not text or not isinstance(text, str):
+                logger.error(f"Invalid text type for doc {doc_id}: {type(text)}")
+                continue
+
+            if len(text.strip()) == 0:
+                logger.error(f"Empty text for doc {doc_id}")
+                continue
+
             chunks = ChunkingService.chunk_text(text)
-            print("chunking after chunked",chunks)
-            logger.info(f"Chunked document {doc['doc_id']} into {len(chunks)} chunks")
-            
+            logger.info(f"Chunked document {doc_id} into {len(chunks)} chunks")
 
             if len(chunks) == 1:
                 # No chunking needed
@@ -54,11 +65,14 @@ class ChunkingService:
             else:
                 # Create multiple documents for chunks
                 for i, chunk in enumerate(chunks):
-                    chunk_doc = doc.copy()
-                    chunk_doc['text'] = chunk
-                    chunk_doc['doc_id'] = f"{doc['doc_id']}_chunk_{i}"
-                    chunked_docs.append(chunk_doc)
-            
-            # print("chunked doc after chunking and appending", chunked_docs)
+                    if not chunk.strip():
+                        logger.warning(f"Empty chunk {i} for doc {doc_id}")
+                        continue
 
+                    chunk_doc = doc.copy()
+                    chunk_doc["text"] = chunk
+                    chunk_doc["doc_id"] = f"{doc['doc_id']}_chunk_{i}"
+                    chunked_docs.append(chunk_doc)
+
+        logger.info(f"Total documents after chunking: {len(chunked_docs)}")
         return chunked_docs

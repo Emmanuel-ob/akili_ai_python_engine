@@ -6,9 +6,10 @@ from app.core.logging_config import logger
 
 class LLMServiceHuggingFace:
     def __init__(self):
+        self.model = "HuggingFaceTB/SmolLM3-3B"
         self.client = InferenceClient(
-            model="mistralai/Mistral-7B-Instruct-v0.3",
-            token=settings.HUGGING_FACE_KEY,  # correct param
+            model=self.model,
+            token=settings.HUGGING_FACE_KEY,
         )
 
     async def generate_response(
@@ -18,7 +19,9 @@ class LLMServiceHuggingFace:
         history: str,
         personality: str = "helpful and professional",
     ) -> str:
-    
+        """
+        Generate a response using Hugging Face Inference API.
+        """
 
         try:
             # Build chat messages
@@ -31,12 +34,16 @@ class LLMServiceHuggingFace:
 
             logger.info(f"Generated chat messages: {messages}")
 
-            # Call chat_completion
-            response = self.client.chat_completion(
-                messages=messages, max_tokens=300, temperature=0.7
+            # ✅ Correct HuggingFace call
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=messages,
+                temperature=0.7,
             )
 
-            # Extract content safely
+            logger.info(f"Raw response from HuggingFace: {response}")
+
+            # ✅ Extract reply safely
             reply = response.choices[0].message["content"]
             logger.info(f"Generated response: {reply[:100]}...")
             return reply
@@ -48,24 +55,32 @@ class LLMServiceHuggingFace:
     def _build_messages(
         self, message: str, context: List[str], history: str, personality: str
     ) -> List[dict]:
-       
+        """
+        Build OpenAI-style messages with context and history.
+        """
+
+        # Put context directly into system prompt to ensure model sees it
+        context_text = (
+            "\n".join([f"- {ctx}" for ctx in context[:3]])
+            if context
+            else "No context provided."
+        )
 
         system_prompt = f"""
-                            You are a {personality} AI assistant. 
-                            You help users by answering their questions based on the provided context.
-                            - Be concise and helpful
-                            - If you don't know, say so politely
-                            - Reference context when relevant
-                            - Keep conversation flow            
-                        """
+You are a {personality} AI assistant.
+You must use the CONTEXT below when answering.
+
+CONTEXT:
+{context_text}
+
+Guidelines:
+- Be concise and helpful
+- If the answer is not in the context, say so politely
+- Reference the context explicitly when possible
+- Keep conversation flow natural
+"""
 
         messages = [{"role": "system", "content": system_prompt}]
-
-        if context:
-            context_text = "\n".join([f"- {ctx[:300]}..." for ctx in context[:3]])
-            messages.append(
-                {"role": "system", "content": f"Context Information:\n{context_text}"}
-            )
 
         if history:
             messages.append(

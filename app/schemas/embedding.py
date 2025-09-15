@@ -14,13 +14,17 @@ class UpsertRequest(BaseModel):
     chatbot_id: str
     provider: str = "openai"
     docs: List[DocumentInput]
-
+    sync_run_id: str = None 
+    
 
 class UpsertResponse(BaseModel):
     success: bool
     message: str
     collection: str
     count: int
+    failed_count: int = 0
+    failed_items: List[Dict[str, Any]] = []
+    processing_stats: Dict[str, int] = {}  
 
 
 class HealthResponse(BaseModel):
