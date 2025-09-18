@@ -6,3 +6,6 @@ __pycache__/
 .vscode/
 logs/
 logs/app.log
+# Ignore all logs
+logs/
+*.log
