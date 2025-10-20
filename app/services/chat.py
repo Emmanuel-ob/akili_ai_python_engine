@@ -3,8 +3,11 @@ from app.schemas.chat import ChatResponse, HistoryMessage, SourceDocument
 from app.services.vectorstore import VectorStoreService
 from app.services.embeddings import EmbeddingServiceOpenai, EmbeddingServiceHuggingFace
 from app.services.llm import LLMServiceHuggingFace
+from app.services.intent_analyzer import IntentAnalyzer
+from app.services.conversation_memory import ConversationMemory, ConversationSummarizer
 from app.core.config import settings
 from app.core.logging_config import logger
+import httpx
 
 
 class ChatService:
@@ -19,6 +22,9 @@ class ChatService:
         self.embedding_openai = embedding_service_openai
         self.embedding_huggingface = embedding_service_huggingface
         self.llm = llm_service
+        self.intent_analyzer = IntentAnalyzer(llm_service)
+        self.memory = ConversationMemory()
+        self.summarizer = ConversationSummarizer(llm_service)
 
     async def generate_response(
         self,
@@ -27,110 +33,183 @@ class ChatService:
         message: str,
         history: List[HistoryMessage],
         chatbot_config: Dict[str, Any],
+        customer_data: Optional[Dict] = None,
+        is_authenticated: bool = False,
+        connection_id: Optional[str] = None,
     ) -> ChatResponse:
-        """Generate chatbot response with context retrieval"""
+        """AI-orchestrated response with vector search and conditional auth"""
 
         try:
-            # 1. Get collection name
-            collection_name = self.vectorstore.get_collection_name(
-                business_id, chatbot_id
-            )
-            logger.info(f"Using collection: {collection_name}")
+            schema_analysis = chatbot_config.get("schema_analysis", {})
+            business_overview = chatbot_config.get("business_overview", "")
 
-            # 2. Generate embedding for user query
-            query_embedding = self.embedding_huggingface.generate_single_embeddings(
-                message
-            )
-            logger.info(f"Generated query embedding")
-
-            # 3. Search vector database for relevant context
-            search_results = self.vectorstore.search_similar(
-                collection_name=collection_name,
-                query_vector=query_embedding,
-                limit=5,  # Top 5 most relevant documents
-            )
-
-            logger.info(f"Found {len(search_results)} relevant documents")
-
-            # 4. Prepare context and sources
-            context_texts = []
-            sources = []
-
-            for result in search_results:
-                context_texts.append(result.payload["text"])
-                sources.append(
-                    SourceDocument(
-                        doc_id=result.payload["doc_id"],
-                        text=result.payload["text"][:200]
-                        + "...",  # Truncate for display
-                        confidence=result.score,
-                        table=result.payload.get("data", {}).get("table"),
-                    )
+            # Check for follow-up context
+            reference_context = self.memory.resolve_reference(message)
+            if reference_context.get("is_followup"):
+                logger.info(
+                    f"Detected follow-up question about: {reference_context.get('current_topic')}"
                 )
 
-            # 5. Build conversation history context
-            history_context = self._format_history(
-                history[-6:]
-            )  # Last 6 messages for context
-
-            # 6. Generate LLM response
-            response_text = await self.llm.generate_response(
-                message=message,
-                context=context_texts,
-                history=history_context,
-                personality=chatbot_config.get(
-                    "personality", "helpful and professional"
-                ),
+            # STEP 1: Analyze Intent
+            intent = await self.intent_analyzer.analyze_intent(
+                message=message, schema=schema_analysis, customer_context=customer_data
             )
 
-            # 7. Calculate confidence based on search results
-            confidence = self._calculate_confidence(search_results)
-
-            return ChatResponse(
-                text=response_text,
-                sources=sources,
-                metadata={
-                    "confidence": confidence,
-                    "context_used": len(context_texts) > 0,
-                    "history_length": len(history),
-                },
+            logger.info(
+                f"Intent: {intent.get('intent_category')}, Safety: {intent.get('safety_level')}"
             )
+
+            # STEP 2: Check if authentication is required
+            requires_auth = intent.get("safety_level") in [
+                "authenticated",
+                "admin_only",
+            ]
+
+            if requires_auth and not is_authenticated:
+                return ChatResponse(
+                    text="This information requires authentication. Please verify your identity to continue.",
+                    sources=[],
+                    metadata={"type": "auth_required", "requires_auth": True},
+                )
+
+            # STEP 3: Route based on intent
+            if intent["intent_category"] == "general_chat":
+                response = await self._handle_general_chat(
+                    message, history, business_overview
+                )
+            else:
+                # Use vector search for all data queries
+                response = await self._handle_rag_flow(
+                    message,
+                    business_id,
+                    chatbot_id,
+                    history,
+                    business_overview,
+                    customer_data,
+                    is_authenticated,
+                )
+
+            # Update conversation memory
+            self.memory.update_context(message, intent, response.text)
+
+            return response
 
         except Exception as e:
-            logger.error(f"Error generating response: {str(e)}")
+            logger.error(f"Error in chat service: {str(e)}")
 
-            # Fallback response
             fallback_message = chatbot_config.get(
                 "fallback_message",
-                "I'm sorry, I didn't understand that. Could you please rephrase?",
+                "I'm sorry, I'm having trouble responding right now. Could you please rephrase?",
             )
 
             return ChatResponse(
                 text=fallback_message,
                 sources=[],
-                metadata={"error": True, "fallback": True, "confidence": 0.0},
+                metadata={"error": True, "fallback": True},
             )
 
+    async def _handle_general_chat(
+        self, message: str, history: List[HistoryMessage], business_overview: str
+    ) -> ChatResponse:
+        """Handle general conversation"""
+
+        history_text = self._format_history(history[-5:])
+
+        response_text = await self.llm.generate_response(
+            message=message,
+            context=[],
+            history=history_text,
+            personality="friendly and helpful",
+            business_overview=business_overview,
+        )
+
+        return ChatResponse(
+            text=response_text, sources=[], metadata={"type": "general_chat"}
+        )
+
+    async def _handle_rag_flow(
+        self,
+        message: str,
+        business_id: str,
+        chatbot_id: str,
+        history: List[HistoryMessage],
+        business_overview: str,
+        customer_data: Optional[Dict] = None,
+        is_authenticated: bool = False,
+    ) -> ChatResponse:
+        """Vector search-based RAG flow"""
+
+        collection_name = self.vectorstore.get_collection_name(business_id, chatbot_id)
+
+        query_embedding = self.embedding_huggingface.generate_single_embeddings(message)
+
+        search_results = self.vectorstore.search_similar(
+            collection_name=collection_name, query_vector=query_embedding, limit=5
+        )
+
+        context_texts = []
+        sources = []
+
+        for result in search_results:
+            # Filter by customer if authenticated and customer_id is available
+            if is_authenticated and customer_data:
+                result_customer = result.payload.get("metadata", {}).get(
+                    "customer_value"
+                )
+                if result_customer and result_customer != customer_data.get("id"):
+                    continue  # Skip data not belonging to this customer
+
+            context_texts.append(result.payload["text"])
+            sources.append(
+                SourceDocument(
+                    doc_id=result.payload["doc_id"],
+                    text=result.payload["text"][:200] + "...",
+                    confidence=result.score,
+                    table=result.payload.get("metadata", {}).get("table"),
+                )
+            )
+
+        history_context = self._format_history(history[-6:])
+
+        response_text = await self.llm.generate_response(
+            message=message,
+            context=context_texts,
+            history=history_context,
+            personality="helpful and professional",
+            business_overview=business_overview,
+        )
+
+        confidence = self._calculate_confidence(search_results)
+
+        return ChatResponse(
+            text=response_text,
+            sources=sources,
+            metadata={
+                "type": "rag",
+                "confidence": confidence,
+                "context_used": len(context_texts) > 0,
+                "authenticated": is_authenticated,
+            },
+        )
+
     def _format_history(self, history: List[HistoryMessage]) -> str:
-        """Format conversation history for LLM context"""
+        """Format conversation history"""
         if not history:
             return ""
 
         formatted = []
         for msg in history:
-            role = "Human" if msg.role == "user" else "Assistant"
+            role = "User" if msg.role == "user" else "Assistant"
             formatted.append(f"{role}: {msg.message}")
 
         return "\n".join(formatted)
 
     def _calculate_confidence(self, search_results) -> float:
-        """Calculate confidence score based on search results"""
+        """Calculate confidence score"""
         if not search_results:
             return 0.0
 
-        # Average of top 3 scores, normalized
         top_scores = [result.score for result in search_results[:3]]
         avg_score = sum(top_scores) / len(top_scores)
 
-        # Convert to 0-1 range (assuming cosine similarity)
         return min(max(avg_score, 0.0), 1.0)
