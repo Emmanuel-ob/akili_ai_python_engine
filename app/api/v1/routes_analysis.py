@@ -8,7 +8,7 @@ from app.schemas.analysis import (
     QueryGenerationResponse,
 )
 from app.services.schema_analyzer import SchemaAnalyzer, BusinessOverviewGenerator
-from app.services.query_generator import SecureQueryGenerator
+
 from app.services.llm import LLMServiceHuggingFace
 from app.core.config import settings
 from app.core.logging_config import logger
@@ -19,7 +19,6 @@ router = APIRouter()
 llm_service = LLMServiceHuggingFace()
 schema_analyzer = SchemaAnalyzer(llm_service)
 overview_generator = BusinessOverviewGenerator(llm_service)
-query_generator = SecureQueryGenerator(llm_service)
 
 
 def verify_api_key(x_akili_key: str = Header(...)):
@@ -35,20 +34,21 @@ async def analyze_schema(
 ):
     """Analyze database table schema and detect relationships"""
 
-    # try:
-    logger.info(f"Analyzing schema for table: {request.table}")
+    try:
+        logger.info(f"Analyzing schema for table: {request.table}")
+        logger.info(f"Available tables: {request.all_tables}")
 
-    analysis = await schema_analyzer.analyze_table_structure(
+        analysis = await schema_analyzer.analyze_table_structure(
             table=request.table, columns=request.columns, all_tables=request.all_tables
         )
-    
-    logger.info(f"Schema analysis result: {analysis}")
 
-    return SchemaAnalysisResponse(success=True, analysis=analysis)
+        logger.info(f"Schema analysis result: {analysis}")
 
-    # except Exception as e:
-    #     logger.error(f"Schema analysis failed: {str(e)}")
-    #     raise HTTPException(status_code=500, detail=str(e))
+        return SchemaAnalysisResponse(success=True, analysis=analysis)
+
+    except Exception as e:
+        logger.error(f"Schema analysis failed: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.post("/business-overview", response_model=BusinessOverviewResponse)
@@ -58,50 +58,41 @@ async def generate_business_overview(
     """Generate comprehensive business overview from schema"""
 
     try:
-        logger.info(f"Generating business overview for {request.table_count} tables")
+        logger.info(
+            f"Generating business overview for {request.table_count} tables: "
+            f"{', '.join(request.selected_tables)}"
+        )
+
+        # Validate that schema_analysis contains the selected tables
+        schema_tables = list(request.schema_analysis.get("tables", {}).keys())
+        missing_tables = [t for t in request.selected_tables if t not in schema_tables]
+
+        if missing_tables:
+            logger.warning(
+                f"Some selected tables not in schema_analysis: {missing_tables}"
+            )
 
         result = await overview_generator.generate_overview(
-            schema_analysis=request.schema_analysis, database_type=request.database_type
+            schema_analysis=request.schema_analysis,
+            database_type=request.database_type,
+            selected_tables=request.selected_tables,  # Pass explicitly
         )
-        
+
+        logger.info(
+            f"Business overview generated successfully. "
+            f"Discovered {len(result.get('discovered_actions', []))} actions."
+        )
 
         return BusinessOverviewResponse(
             success=True,
             overview=result.get("overview", ""),
             discovered_actions=result.get("discovered_actions", []),
+            analyzed_tables=result.get("analyzed_tables", request.selected_tables),
         )
 
+    except ValueError as e:
+        logger.error(f"Validation error in business overview: {str(e)}")
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         logger.error(f"Business overview generation failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@router.post("/query/generate", response_model=QueryGenerationResponse)
-async def generate_query(
-    request: QueryGenerationRequest, _: bool = Depends(verify_api_key)
-):
-    """Generate safe database query from user intent"""
-
-    try:
-        logger.info(f"Generating query for: {request.user_question}")
-
-        # This would typically get intent first, but for direct query generation:
-        result = await query_generator.generate_query(
-            intent={"description": request.user_question, "target_tables": []},
-            schema=request.schema,
-            customer_id=request.customer_id,
-            connection_type=request.connection_type,
-        )
-
-        return QueryGenerationResponse(
-            success=result.get("success", False),
-            query=result.get("query", ""),
-            explanation=result.get("explanation", ""),
-            tables_used=result.get("tables_used", []),
-            requires_auth=result.get("requires_auth", False),
-            safe=result.get("safe", False),
-        )
-
-    except Exception as e:
-        logger.error(f"Query generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

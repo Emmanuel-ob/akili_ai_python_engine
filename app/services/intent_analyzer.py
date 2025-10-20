@@ -35,7 +35,7 @@ class IntentAnalyzer:
 
 User Message: "{message}"
 
-Available Data:
+Available Data (ONLY USE THESE TABLES):
 {chr(10).join(["- " + t for t in tables_with_types])}
 
 Customer Context: {customer_info}
@@ -47,7 +47,7 @@ Classify the intent:
    - "general_chat" (greeting, thanks, general conversation)
 
 2. Requires Database Query: true/false
-3. Target Tables: which tables are needed?
+3. Target Tables: which tables from the AVAILABLE DATA above?
 4. Customer Filter Needed: true/false (must filter by customer_id?)
 5. Safety Level:
    - "public" (anyone can access)
@@ -55,6 +55,8 @@ Classify the intent:
    - "admin_only" (only business owner)
 
 6. Specific Fields Needed: what data columns?
+
+IMPORTANT: target_tables MUST only contain tables from the Available Data list above.
 
 Return JSON:
 {{
@@ -70,9 +72,21 @@ Return JSON:
         try:
             response = await self.llm.generate_structured_response(prompt)
 
+            # Filter target_tables to only include available tables
+            target_tables = response.get("target_tables", [])
+            filtered_tables = [t for t in target_tables if t in available_tables]
+            response["target_tables"] = filtered_tables
+
+            # If no valid tables remain but query is required, mark as general_chat
+            if response.get("requires_database_query") and not filtered_tables:
+                response["requires_database_query"] = False
+                response["intent_category"] = "general_chat"
+
             # Validate and enhance response
             if response.get("requires_customer_filter") and not customer_context:
                 response["requires_auth"] = True
+            else:
+                response["requires_auth"] = False
 
             return response
 
