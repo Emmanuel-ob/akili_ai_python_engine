@@ -9,3 +9,4 @@ logs/app.log
 # Ignore all logs
 logs/
 *.log
+project-tree.txt

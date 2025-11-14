@@ -52,9 +52,6 @@ async def chat_respond(
         message=request.message,
         history=request.history,
         chatbot_config=request.chatbot_config,
-        customer_data=request.customer_data,
-        connection_id=request.connection_id,
-        is_authenticated=request.is_authenticated
         )
 
         
