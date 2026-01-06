@@ -1,3 +1,4 @@
+from sqlite3 import connect
 from fastapi import APIRouter, HTTPException, Depends, Header
 from app.schemas.chat import ChatRequest, ChatResponse, HistoryMessage
 from app.services.chat import ChatService
@@ -46,12 +47,13 @@ async def chat_respond(
         
         # Generate response using chat service
         response = await chat_service.generate_response(
-            business_id=request.business_id,
-            chatbot_id=request.chatbot_id,
-            message=request.message,
-            history=request.history,
-            chatbot_config=request.chatbot_config
+        business_id=request.business_id,
+        chatbot_id=request.chatbot_id,
+        message=request.message,
+        history=request.history,
+        chatbot_config=request.chatbot_config,
         )
+
         
         logger.info(f"Generated response: {response.text[:100]}...")
         return response

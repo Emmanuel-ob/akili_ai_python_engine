@@ -21,6 +21,9 @@ class ChatRequest(BaseModel):
     session_id: str
     history: List[HistoryMessage] = []
     chatbot_config: Dict[str, Any] = {}
+    connection_id: Optional[str] = None  
+    customer_data: Optional[Dict[str, Any]] = None  
+    is_authenticated: bool = False  
 
 
 class SourceDocument(BaseModel):
