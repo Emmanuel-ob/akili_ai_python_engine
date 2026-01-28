@@ -1,76 +1,86 @@
-from re import L
-from urllib import response
-import openai
 from typing import List
-import numpy as np
-from huggingface_hub import InferenceClient
+from google import genai
+from google.genai import types
 from app.core.config import settings
 from app.core.logging_config import logger
 
-# Initialize OpenAI client
-openai.api_key = settings.OPENAI_API_KEY
 
+class EmbeddingService:
+    """
+    Unified embedding service using Google Gemini
 
-class EmbeddingServiceOpenai:
-    @staticmethod
-    def generate_embeddings(
-        texts: List[str], provider: str = "openai"
-    ) -> List[List[float]]:
-        """Generate embeddings for a list of texts"""
-        if provider == "openai":
-            response = openai.embeddings.create(
-                model=settings.EMBEDDING_MODEL, input=texts
-            )
-            return [item.embedding for item in response.data]
-        else:
-            raise ValueError(f"Unsupported embedding provider: {provider}")
+    Uses: gemini-embedding-001 model (latest, replaces text-embedding-004)
+    Free tier: 1,500 requests/minute
+    Context: Up to 2,048 tokens per input
+    Output: 768 dimensions (configurable up to 3072)
+    """
 
-    @staticmethod
-    def generate_single_embedding(text: str, provider: str = "openai") -> List[float]:
-        """Generate embedding for a single text"""
-        embeddings = EmbeddingServiceOpenai.generate_embeddings([text], provider)
-        return embeddings[0]
+    def __init__(self):
+        # Initialize the new genai client
+        self.client = genai.Client(api_key=settings.GEMINI_API_KEY)
+        self.model = settings.EMBEDDING_MODEL  # "gemini-embedding-001"
+        logger.info(f"Initialized Gemini embedding service with model: {self.model}")
 
+    def generate_embeddings(self, texts: List[str]) -> List[List[float]]:
+        """
+        Generate embeddings for multiple texts
 
-class EmbeddingServiceHuggingFace:
-    client = InferenceClient(
-        model="sentence-transformers/all-mpnet-base-v2",
-        api_key=settings.HUGGING_FACE_KEY,
-    )
+        Args:
+            texts: List of text strings to embed
 
-    @staticmethod
-    def generate_embeddings(texts):
-        """Generate embeddings for a list of texts using Hugging Face"""
+        Returns:
+            List of embedding vectors (each is a list of floats)
+        """
         try:
-            # Feature extraction can handle a batch list directly
-            response = EmbeddingServiceHuggingFace.client.feature_extraction(texts)
-            logger.info(f"Generated HuggingFace embeddings for {len(texts)} texts")
-            logger.info(
-                f"Response type: {type(response)}, Shape: {response.shape if hasattr(response, 'shape') else 'No shape'}"
+            if not texts:
+                raise ValueError("Empty text list provided")
+
+            # Validate inputs
+            for i, text in enumerate(texts):
+                if not isinstance(text, str):
+                    raise ValueError(f"Text at index {i} is not a string: {type(text)}")
+                if not text.strip():
+                    raise ValueError(f"Text at index {i} is empty")
+
+            logger.info(f"Generating embeddings for {len(texts)} texts using Gemini")
+
+            # New SDK: Use embed_content with batch of texts
+            result = self.client.models.embed_content(
+                model=self.model,
+                contents=texts,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT",  # For storing in vector DB
+                    output_dimensionality=settings.EMBEDDING_SIZE,  # 768
+                ),
             )
 
-            # Convert to proper format if needed
-            if isinstance(response, np.ndarray):
-                response = response.tolist()
+            # Extract embeddings from result
+            embeddings = [emb.values for emb in result.embeddings]
 
-            # Validate the response structure
-            if not isinstance(response, list):
-                raise ValueError(f"Unexpected response type: {type(response)}")
+            logger.info(f"Successfully generated {len(embeddings)} embeddings")
 
-            # For batch processing, we expect a list of embeddings
-            if len(response) != len(texts):
+            # Validate output
+            if len(embeddings) != len(texts):
                 raise ValueError(
-                    f"Mismatch: {len(texts)} texts but {len(response)} embeddings"
+                    f"Mismatch: {len(texts)} texts but {len(embeddings)} embeddings"
                 )
 
-            return response
+            return embeddings
+
         except Exception as e:
-            logger.error(f"HuggingFace batch embedding failed: {str(e)}")
+            logger.error(f"Gemini batch embedding failed: {str(e)}")
             raise
 
-    @staticmethod
-    def generate_single_embeddings(text):
-        """Generate embedding for a single text using Hugging Face"""
+    def generate_single_embedding(self, text: str) -> List[float]:
+        """
+        Generate embedding for a single text
+
+        Args:
+            text: Text string to embed
+
+        Returns:
+            Embedding vector (list of floats)
+        """
         try:
             # Validate input
             if not isinstance(text, str):
@@ -81,62 +91,28 @@ class EmbeddingServiceHuggingFace:
 
             logger.info(f"Generating single embedding for text length: {len(text)}")
 
-            # Call the API with a single string (not a list)
-            response = EmbeddingServiceHuggingFace.client.feature_extraction(text)
-
-            logger.info(f"Raw response type: {type(response)}")
-            logger.info(
-                f"Raw response shape: {response.shape if hasattr(response, 'shape') else 'No shape'}"
+            # Generate embedding using new SDK
+            result = self.client.models.embed_content(
+                model=self.model,
+                contents=text,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_DOCUMENT",
+                    output_dimensionality=settings.EMBEDDING_SIZE,
+                ),
             )
 
-            # Handle the response format
-            if isinstance(response, np.ndarray):
-                if response.ndim == 1:
-                    # Single embedding vector - this is what we expect
-                    embedding = response.tolist()
-                elif response.ndim == 2:
-                    # 2D array - this might happen if the model returns [1, embedding_dim]
-                    if response.shape[0] == 1:
-                        # Single embedding in a batch format
-                        embedding = response[0].tolist()
-                    else:
-                        raise ValueError(
-                            f"Unexpected 2D array shape: {response.shape}. Expected single embedding."
-                        )
-                else:
-                    raise ValueError(f"Unexpected array dimensions: {response.ndim}")
+            # Extract embedding values
+            embedding = result.embeddings[0].values
 
-            elif isinstance(response, list):
-                if isinstance(response[0], (int, float)):
-                    # Already a flat list of numbers - single embedding
-                    embedding = response
-                elif isinstance(response[0], list):
-                    if len(response) == 1:
-                        # Single embedding wrapped in a list
-                        embedding = response[0]
-                    else:
-                        raise ValueError(
-                            f"Unexpected nested list structure: {len(response)} embeddings returned for single text"
-                        )
-                else:
-                    raise ValueError(
-                        f"Unexpected list element type: {type(response[0])}"
-                    )
-            else:
-                raise ValueError(f"Unexpected response type: {type(response)}")
-
-            # Validate the final embedding
+            # Validate output
             if not isinstance(embedding, list):
-                raise ValueError(f"Final embedding is not a list: {type(embedding)}")
+                raise ValueError(f"Embedding is not a list: {type(embedding)}")
 
             if len(embedding) == 0:
                 raise ValueError("Empty embedding vector")
 
-            # Ensure all elements are numbers
-            try:
-                embedding = [float(x) for x in embedding]
-            except (ValueError, TypeError) as e:
-                raise ValueError(f"Non-numeric values in embedding: {e}")
+            # Ensure all elements are floats
+            embedding = [float(x) for x in embedding]
 
             logger.info(
                 f"Successfully generated embedding with dimension: {len(embedding)}"
@@ -145,6 +121,58 @@ class EmbeddingServiceHuggingFace:
 
         except Exception as e:
             logger.error(
-                f"HuggingFace single embedding failed for text '{text[:100]}...': {str(e)}"
+                f"Gemini single embedding failed for text '{text[:100]}...': {str(e)}"
             )
             raise
+
+    def generate_query_embedding(self, query: str) -> List[float]:
+        """
+        Generate embedding optimized for query (search) use
+
+        Args:
+            query: Query text to embed
+
+        Returns:
+            Embedding vector (list of floats)
+        """
+        try:
+            if not isinstance(query, str):
+                raise ValueError(f"Expected string input, got {type(query)}")
+
+            if not query.strip():
+                raise ValueError("Empty query input")
+
+            logger.info(f"Generating query embedding for: {query[:50]}...")
+
+            # Use RETRIEVAL_QUERY task type for search queries
+            result = self.client.models.embed_content(
+                model=self.model,
+                contents=query,
+                config=types.EmbedContentConfig(
+                    task_type="RETRIEVAL_QUERY",  # Optimized for querying
+                    output_dimensionality=settings.EMBEDDING_SIZE,
+                ),
+            )
+
+            embedding = result.embeddings[0].values
+
+            # Validate and convert
+            if not isinstance(embedding, list):
+                raise ValueError(f"Embedding is not a list: {type(embedding)}")
+
+            if len(embedding) == 0:
+                raise ValueError("Empty embedding vector")
+
+            embedding = [float(x) for x in embedding]
+
+            logger.info(f"Successfully generated query embedding")
+            return embedding
+
+        except Exception as e:
+            logger.error(f"Gemini query embedding failed: {str(e)}")
+            raise
+
+
+# Backward compatibility aliases (for minimal code changes in routes)
+EmbeddingServiceOpenai = EmbeddingService  # Old name → New service
+EmbeddingServiceHuggingFace = EmbeddingService  # Old name → New service

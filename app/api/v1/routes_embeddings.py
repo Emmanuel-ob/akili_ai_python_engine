@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException, Depends, Header
 from app.schemas.embedding import UpsertRequest, UpsertResponse
-from app.services.embeddings import EmbeddingServiceHuggingFace, EmbeddingServiceOpenai
+from app.services.embeddings import EmbeddingService
 from app.services.vectorstore import VectorStoreService
 from app.services.chunking import ChunkingService
 from app.core.config import settings
@@ -8,11 +8,11 @@ from app.core.logging_config import logger
 
 router = APIRouter()
 
-# Initialize services
-embedding_service = EmbeddingServiceOpenai()
+# Initialize services (unified embedding service)
+embedding_service = EmbeddingService()
 vectorstore_service = VectorStoreService()
 chunking_service = ChunkingService()
-embedding_service_huggingface = EmbeddingServiceHuggingFace()
+
 
 def verify_api_key(x_akili_key: str = Header(...)):
     """Verify the API key from request header"""
@@ -25,6 +25,7 @@ def verify_api_key(x_akili_key: str = Header(...)):
 async def upsert_embeddings(request: UpsertRequest, _: bool = Depends(verify_api_key)):
     """
     Enhanced upsert with granular error tracking
+    Uses Gemini for all embeddings
     """
     try:
         # Get collection name
@@ -64,29 +65,18 @@ async def upsert_embeddings(request: UpsertRequest, _: bool = Depends(verify_api
                 if not text or len(text.strip()) == 0:
                     raise ValueError("Empty text content")
 
-                # Step 2: Generate embedding
+                # Step 2: Generate embedding using Gemini
                 embedding = None
                 try:
-                    if request.provider == "openai":
-                        embedding = embedding_service.generate_single_embedding(
-                            text, request.provider
-                        )
-                    elif request.provider == "huggingface":
-                        embedding = (
-                            embedding_service_huggingface.generate_single_embeddings(
-                                text
-                            )
-                        )
-                    else:
-                        raise ValueError(f"Unsupported provider: {request.provider}")
+                    embedding = embedding_service.generate_single_embedding(text)
 
                     # Validate embedding format
                     if not embedding or not isinstance(embedding, list):
                         raise ValueError("Embedding generation returned invalid format")
-                    
+
                     if len(embedding) == 0:
                         raise ValueError("Embedding generation returned empty result")
-                    
+
                     # Ensure all values are float
                     embedding = [float(x) for x in embedding]
 
@@ -97,8 +87,8 @@ async def upsert_embeddings(request: UpsertRequest, _: bool = Depends(verify_api
                             "doc_id": doc_id,
                             "error": f"Embedding error: {str(e)}",
                             "stage": "embedding_generation",
-                            "provider": request.provider,
-                            "text_length": len(text)
+                            "provider": "gemini",
+                            "text_length": len(text),
                         }
                     )
                     logger.error(f"Embedding failed for {doc_id}: {str(e)}")

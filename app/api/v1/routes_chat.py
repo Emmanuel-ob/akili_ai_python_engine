@@ -2,8 +2,8 @@ from fastapi import APIRouter, HTTPException, Depends, Header, Request
 from app.schemas.chat import ChatRequest, ChatResponse
 from app.services.chat import ChatService
 from app.services.vectorstore import VectorStoreService
-from app.services.embeddings import EmbeddingServiceOpenai, EmbeddingServiceHuggingFace
-from app.services.llm import LLMServiceHuggingFace
+from app.services.embeddings import EmbeddingService  # Updated: Unified service
+from app.services.llm import LLMService  # Updated: Unified service
 from app.core.config import settings
 from app.core.logging_config import logger
 
@@ -17,15 +17,15 @@ from app.services.subscription_validator import (
 
 router = APIRouter()
 
-# Initialize services
-embedding_service_openai = EmbeddingServiceOpenai()
-embedding_service_huggingface = EmbeddingServiceHuggingFace()
+# Initialize services (unified - no more separate providers)
+embedding_service = EmbeddingService()  # Single unified embedding service
 vectorstore_service = VectorStoreService()
-llm_service = LLMServiceHuggingFace()
+llm_service = LLMService()  # Single unified LLM service
+
+# Initialize chat service with unified services
 chat_service = ChatService(
     vectorstore_service=vectorstore_service,
-    embedding_service_openai=embedding_service_openai,
-    embedding_service_huggingface=embedding_service_huggingface,
+    embedding_service=embedding_service,  # Updated parameter name
     llm_service=llm_service,
 )
 

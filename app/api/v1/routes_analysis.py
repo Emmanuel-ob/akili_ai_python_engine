@@ -8,15 +8,14 @@ from app.schemas.analysis import (
     QueryGenerationResponse,
 )
 from app.services.schema_analyzer import SchemaAnalyzer, BusinessOverviewGenerator
-
-from app.services.llm import LLMServiceHuggingFace
+from app.services.llm import LLMService
 from app.core.config import settings
 from app.core.logging_config import logger
 
 router = APIRouter()
 
 # Initialize services
-llm_service = LLMServiceHuggingFace()
+llm_service = LLMService()
 schema_analyzer = SchemaAnalyzer(llm_service)
 overview_generator = BusinessOverviewGenerator(llm_service)
 

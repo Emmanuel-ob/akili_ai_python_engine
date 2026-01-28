@@ -3,7 +3,7 @@ from pydantic import BaseModel
 from typing import List, Dict, Any
 from app.services.faq_manager import FAQManager
 from app.services.vectorstore import VectorStoreService
-from app.services.embeddings import EmbeddingServiceHuggingFace
+from app.services.embeddings import EmbeddingService
 from app.core.config import settings
 from app.core.logging_config import logger
 
@@ -11,7 +11,7 @@ router = APIRouter()
 
 # Initialize services
 vectorstore_service = VectorStoreService()
-embedding_service = EmbeddingServiceHuggingFace()
+embedding_service = EmbeddingService()
 faq_manager = FAQManager(vectorstore_service, embedding_service)
 
 
@@ -80,7 +80,7 @@ async def process_file(
 @router.post("/embed")
 async def embed_faq(request: FAQEmbedRequest, _: bool = Depends(verify_api_key)):
     """
-    Embed FAQ content into vector database
+    Embed FAQ content into vector database using Gemini
     """
     try:
         logger.info(

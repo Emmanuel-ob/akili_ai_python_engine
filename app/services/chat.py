@@ -1,8 +1,8 @@
 from typing import List, Dict, Any, Optional
 from app.schemas.chat import ChatResponse, HistoryMessage, SourceDocument
 from app.services.vectorstore import VectorStoreService
-from app.services.embeddings import EmbeddingServiceOpenai, EmbeddingServiceHuggingFace
-from app.services.llm import LLMServiceHuggingFace
+from app.services.embeddings import EmbeddingService  # Updated: Single unified service
+from app.services.llm import LLMService  # Updated: Unified LLM service
 from app.services.conversation_memory import ConversationMemory, ConversationSummarizer
 from app.services.query_classifier import QueryClassifier
 from app.services.sql_generator import SQLGenerator
@@ -17,13 +17,11 @@ class ChatService:
     def __init__(
         self,
         vectorstore_service: VectorStoreService,
-        embedding_service_openai: EmbeddingServiceOpenai,
-        embedding_service_huggingface: EmbeddingServiceHuggingFace,
-        llm_service: LLMServiceHuggingFace,
+        embedding_service: EmbeddingService,  # Updated: Single unified service
+        llm_service: LLMService,  # Updated: Unified LLM service
     ):
         self.vectorstore = vectorstore_service
-        self.embedding_openai = embedding_service_openai
-        self.embedding_huggingface = embedding_service_huggingface
+        self.embedding = embedding_service  # Updated: Single embedding service
         self.llm = llm_service
         self.memory = ConversationMemory()
         self.summarizer = ConversationSummarizer(llm_service)
@@ -226,41 +224,37 @@ class ChatService:
                     ):
                         execution_result = retry_execution
                         sql_result = retry_result
-                        logger.info(
-                            f"✅ Retry successful! Found {retry_execution.get('row_count')} results"
-                        )
+                        row_count = execution_result.get("row_count", 0)
+                        logger.info(f"Retry successful: {row_count} rows")
 
-            logger.info("Formatting query results...")
-
-            formatted_answer = await self.llm.format_query_results(
+            response_text = await self.llm.format_query_results(
                 question=message,
                 data=execution_result.get("data", []),
                 explanation=sql_result.get("explanation", ""),
             )
 
             return ChatResponse(
-                text=formatted_answer,
+                text=response_text,
                 sources=[
                     SourceDocument(
-                        doc_id="database_query",
-                        text=sql_result.get("explanation", ""),
-                        confidence=1.0,
-                        table=", ".join(sql_result.get("tables_used", [])),
+                        doc_id="sql_result",
+                        text=f"SQL Query: {sql_result['sql']}",
+                        confidence=0.95,
+                        table="database",
                     )
                 ],
                 metadata={
-                    "type": "database_query",
+                    "type": "sql",
                     "sql": sql_result["sql"],
-                    "row_count": execution_result.get("row_count", 0),
-                    "execution_time_ms": execution_result.get("execution_time_ms", 0),
-                    "was_retry": sql_result.get("is_retry", False),
+                    "row_count": row_count,
+                    "explanation": sql_result.get("explanation", ""),
                 },
             )
 
         except Exception as e:
             logger.error(f"SQL query handling failed: {str(e)}", exc_info=True)
             return ChatResponse(
-                text="I encountered an error while searching the database. Please try rephrasing your question.",
+                text="I encountered an error while processing your database query. Please try rephrasing your question.",
                 sources=[],
                 metadata={"type": "sql_error", "error": str(e)},
             )
@@ -275,15 +269,7 @@ class ChatService:
         history: List[HistoryMessage],
         chatbot_config: Dict[str, Any],
     ) -> ChatResponse:
-        """Handle queries needing both FAQ and SQL"""
-
-        faq_response = await self._search_faq(
-            business_id,
-            chatbot_id,
-            message,
-            history,
-            chatbot_config.get("business_overview", ""),
-        )
+        """Handle queries that need both SQL and FAQ data"""
 
         sql_response = await self._handle_sql_query(
             message,
@@ -294,9 +280,18 @@ class ChatService:
             chatbot_config,
         )
 
+        faq_response = await self._search_faq(
+            business_id,
+            chatbot_id,
+            message,
+            history,
+            chatbot_config.get("business_overview", ""),
+        )
+
         combined_parts = []
-        if sql_response.text:
+        if sql_response and sql_response.text:
             combined_parts.append(sql_response.text)
+
         if faq_response and faq_response.text:
             combined_parts.append("\n\nAdditional information from our knowledge base:")
             combined_parts.append(faq_response.text)
@@ -353,10 +348,12 @@ class ChatService:
         history: List[HistoryMessage],
         business_overview: str,
     ) -> Optional[ChatResponse]:
-        """Search FAQ embeddings"""
+        """Search FAQ embeddings - Updated to use unified embedding service"""
 
         collection_name = self.vectorstore.get_collection_name(business_id, chatbot_id)
-        query_embedding = self.embedding_huggingface.generate_single_embeddings(message)
+
+        # Updated: Use unified embedding service
+        query_embedding = self.embedding.generate_query_embedding(message)
 
         search_results = self.vectorstore.search_similar(
             collection_name=collection_name,
