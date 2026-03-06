@@ -1,5 +1,5 @@
 from pydantic import BaseModel
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Literal
 
 
 class HistoryMessage(BaseModel):
@@ -21,6 +21,7 @@ class ChatRequest(BaseModel):
     session_id: str
     history: List[HistoryMessage] = []
     chatbot_config: Dict[str, Any] = {}
+    user_type: Literal["internal", "external"] = "external"
     connection_id: Optional[str] = None  
     customer_data: Optional[Dict[str, Any]] = None  
     is_authenticated: bool = False  
