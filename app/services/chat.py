@@ -9,9 +9,31 @@ from app.services.sql_generator import SQLGenerator
 from app.services.sql_validator import SQLValidator
 from app.services.sql_executor import DirectSQLExecutor
 from app.services.config_cache import ConfigCache
-from app.services.response_sanitizer import ResponseSanitizer  # ✅ NEW
+from app.services.response_sanitizer import ResponseSanitizer
+from app.services.insight_engine import get_recent_insights_summary  # Point 5A
 from app.core.config import settings
 from app.core.logging_config import logger
+
+
+def _build_visitor_context(identity: dict) -> str:
+    """Build a one-line visitor context string for prompt injection."""
+    if not identity:
+        return ""
+    parts = []
+    if identity.get("name"):
+        parts.append(f"Name: {identity['name']}")
+    if identity.get("email"):
+        parts.append(f"Email: {identity['email']}")
+    if identity.get("user_id"):
+        parts.append(f"ID: {identity['user_id']}")
+    if identity.get("plan"):
+        parts.append(f"Plan: {identity['plan']}")
+    if identity.get("phone"):
+        parts.append(f"Phone: {identity['phone']}")
+    if identity.get("custom") and isinstance(identity["custom"], dict):
+        for k, v in list(identity["custom"].items())[:3]:
+            parts.append(f"{k}: {v}")
+    return " | ".join(parts) if parts else ""
 
 
 class ChatService:
@@ -103,10 +125,73 @@ class ChatService:
                 self.config_cache.set(connection_id, database_config)
                 logger.info(f"Cached config for connection: {connection_id}")
 
-            schema_analysis = chatbot_config.get("schema_analysis", {})
+            # Point 1: Prefer rich DatabaseProfile over legacy schema_analysis.
+            # database_profile is built once at sync time and contains full schema,
+            # real FK constraints, enum hints, entity types, and business narrative.
+            # Falls back gracefully to legacy schema_analysis if profile not yet built.
+            database_profile = chatbot_config.get("database_profile")
+            if database_profile:
+                schema_analysis = self._profile_to_schema(database_profile)
+                # Point 2: pass allowlist into SQL generator
+                chatbot_config["_selected_tables"] = database_profile.get(
+                    "selected_tables", []
+                )
+                chatbot_config["_table_classifications"] = database_profile.get(
+                    "table_classifications", {}
+                )
+                logger.info(
+                    f"Using DatabaseProfile (Point 1) for connection {connection_id}"
+                )
+            else:
+                schema_analysis = chatbot_config.get("schema_analysis", {})
+                logger.info(
+                    f"Using legacy schema_analysis for connection {connection_id}"
+                )
+
+            # Point 4: extract visitor identity from widget XeliAI.identify()
+            # Used as customer_id for SQL filtering + injected into prompts
+            visitor_identity = chatbot_config.get("visitor_identity") or {}
+            if visitor_identity:
+                logger.info(
+                    f"Visitor identified: name={visitor_identity.get('name')}, "
+                    f"email={visitor_identity.get('email')}, id={visitor_identity.get('user_id')}"
+                )
+                # Use email or user_id as the customer_id for SQL filtering
+                chatbot_config.setdefault(
+                    "customer_id",
+                    visitor_identity.get("user_id") or visitor_identity.get("email"),
+                )
+                # Enrich business_overview with visitor context so LLM knows who it's talking to
+                visitor_ctx = _build_visitor_context(visitor_identity)
+                if visitor_ctx:
+                    existing = chatbot_config.get("business_overview", "")
+                    chatbot_config["business_overview"] = (
+                        f"{existing}\n\nCURRENT VISITOR: {visitor_ctx}"
+                        if existing
+                        else f"CURRENT VISITOR: {visitor_ctx}"
+                    )
+
+            # B1: Cross-session visitor memory — inject accumulated profile for returning visitors
+            visitor_context = chatbot_config.get("visitor_context")
+            if visitor_context and user_type == "external":
+                existing = chatbot_config.get("business_overview", "")
+                chatbot_config["business_overview"] = (
+                    f"{existing}\n\nRETURNING VISITOR PROFILE: {visitor_context}"
+                    if existing
+                    else f"RETURNING VISITOR PROFILE: {visitor_context}"
+                )
+                logger.info(f"B1: Injected returning visitor context into prompt")
+
             has_database = bool(connection_id and schema_analysis and database_config)
 
-            route = QueryClassifier.classify(message, has_database)
+            # Point 3: pass recent history for context-aware routing
+            route = QueryClassifier.classify(
+                message,
+                has_database,
+                recent_history=[
+                    m.dict() if hasattr(m, "dict") else m for m in (history or [])
+                ],
+            )
             logger.info(f"Query route: {route}, user_type: {user_type}")
 
             # ─────────────────────────────────────────────────
@@ -141,6 +226,8 @@ class ChatService:
                     chatbot_id,
                     history,
                     business_overview,
+                    user_type=user_type,
+                    chatbot_config=chatbot_config,
                 )
 
             # ─────────────────────────────────────────────────
@@ -207,11 +294,30 @@ class ChatService:
                 database_type=database_type,
                 customer_id=chatbot_config.get("customer_id"),
                 is_authenticated=chatbot_config.get("is_authenticated", False),
+                # Point 2: allowlist enforcement
+                selected_tables=chatbot_config.get("_selected_tables"),
+                table_classifications=chatbot_config.get("_table_classifications"),
             )
 
             if not sql_result.get("safe"):
+                explanation = sql_result.get("explanation", "")
+                blocked_reason = sql_result.get("blocked_reason", "")
+
+                # Point 3: friendly error messages instead of raw technical errors
+                if blocked_reason == "table_not_allowed":
+                    # Our validator caught a forbidden table — use the clean message
+                    user_message = explanation
+                elif "No SQL generated" in explanation or not explanation:
+                    # LLM refused — likely because the question references unavailable data
+                    user_message = (
+                        "I can only answer questions about the data in this system. "
+                        "That information isn't available here — try asking about something else."
+                    )
+                else:
+                    user_message = explanation
+
                 return ChatResponse(
-                    text=sql_result.get("explanation", "Cannot process this query"),
+                    text=user_message,
                     sources=[],
                     metadata={"type": "sql_error", "reason": "unsafe_query"},
                 )
@@ -258,6 +364,8 @@ class ChatService:
                     customer_id=chatbot_config.get("customer_id"),
                     is_authenticated=chatbot_config.get("is_authenticated", False),
                     previous_attempt=sql_result,
+                    selected_tables=chatbot_config.get("_selected_tables"),
+                    table_classifications=chatbot_config.get("_table_classifications"),
                 )
 
                 if retry_result.get("sql") and retry_result["sql"] != sql_result["sql"]:
@@ -415,7 +523,62 @@ class ChatService:
         chatbot_id: str,
         history: List[HistoryMessage],
         business_overview: str,
+        user_type: str = "external",
+        chatbot_config: Optional[Dict[str, Any]] = None,
     ) -> ChatResponse:
+        # Point 5C: Internal users get the richer BI-analyst prompt path —
+        # BUT only for actual data/business questions, not greetings or small talk.
+        if user_type == "internal" and not self._is_conversational(message):
+            recent_insights = await get_recent_insights_summary(
+                (chatbot_config or {}).get("recent_insights", [])
+            )
+            # Search internal_report chunks as well as FAQ
+            faq_ctx = await self._search_knowledge(
+                business_id,
+                chatbot_id,
+                message,
+                history,
+                business_overview,
+                include_internal_reports=True,
+            )
+            context_texts = [r.payload["text"] for r in (faq_ctx or [])]
+
+            history_text = self._format_history(history[-8:])
+            response_text = await self.llm.generate_internal_response(
+                message=message,
+                context=context_texts,
+                history=history_text,
+                business_name=(chatbot_config or {}).get("business_name", ""),
+                user_role=((chatbot_config or {}).get("visitor_identity") or {}).get(
+                    "plan", ""
+                ),
+                recent_insights=recent_insights,
+            )
+            return ChatResponse(
+                text=response_text,
+                sources=[],
+                metadata={"type": "internal_faq", "internal_mode": True},
+            )
+
+        # External path — same as before
+        # Point 3: if last turn was a SQL result, try to answer grounded in that data
+        last_sql_ctx = QueryClassifier.extract_last_sql_context(
+            [m.dict() if hasattr(m, "dict") else m for m in (history or [])]
+        )
+        if last_sql_ctx and len(message.split()) <= 12:
+            # Short follow-up after SQL — answer using the actual data context
+            grounded = await self.llm.answer_with_sql_context(
+                question=message,
+                sql_context=last_sql_ctx,
+                business_overview=business_overview,
+            )
+            if grounded:
+                return ChatResponse(
+                    text=grounded,
+                    sources=[],
+                    metadata={"type": "sql_followup", "grounded": True},
+                )
+
         faq_response = await self._search_faq(
             business_id, chatbot_id, message, history, business_overview
         )
@@ -429,6 +592,37 @@ class ChatService:
             )
 
         return await self._handle_general_chat(message, history, business_overview)
+
+    async def _search_knowledge(
+        self,
+        business_id: str,
+        chatbot_id: str,
+        message: str,
+        history,
+        business_overview: str,
+        include_internal_reports: bool = False,
+    ):
+        """Search FAQ chunks + optionally internal_report chunks (Point 5B)."""
+        collection_name = self.vectorstore.get_collection_name(business_id, chatbot_id)
+        query_embedding = self.embedding.generate_query_embedding(message)
+
+        # Build source_type filter
+        source_filter = "faq" if not include_internal_reports else None
+
+        results = self.vectorstore.search_similar(
+            collection_name=collection_name,
+            query_vector=query_embedding,
+            limit=5,
+            business_id=business_id,
+            chatbot_id=chatbot_id,
+            source_type_filter=source_filter,
+        )
+
+        if not results:
+            return []
+
+        # Filter by minimum confidence
+        return [r for r in results if r.score >= 0.20]
 
     async def _search_faq(
         self,
@@ -534,6 +728,113 @@ class ChatService:
     # ─────────────────────────────────────────────────────────────────
     # Helpers
     # ─────────────────────────────────────────────────────────────────
+
+    def _profile_to_schema(self, profile: dict) -> dict:
+        """
+        Point 1: Convert DatabaseProfile to the schema dict SQLGenerator expects.
+        This means sql_generator.py needs zero changes — it still receives the same
+        {tables: {table: {columns, foreign_keys, entity_type, ...}}} structure.
+        """
+        schema = {"tables": {}}
+
+        for table, summary in profile.get("schema_summary", {}).items():
+            schema["tables"][table] = {
+                "columns": summary.get("columns", []),
+                "foreign_keys": summary.get("foreign_keys", []),
+                "entity_type": summary.get("entity_type", "unknown"),
+                "customer_identifier": summary.get("customer_identifier"),
+                "enum_hints": summary.get("enum_hints", {}),
+                "sample_values": summary.get("sample_values", []),
+            }
+
+        schema["business_type"] = profile.get("business_type", "unknown")
+        schema["relationships"] = profile.get("relationships", [])
+        return schema
+
+    def _is_conversational(self, message: str) -> bool:
+        """
+        Returns True if the message is a greeting, small talk, or too short
+        to be a meaningful business/data question.
+        Internal users who say "hi" should get a normal greeting,
+        not a BI analyst response.
+        """
+        msg = message.strip().lower()
+
+        # Too short to be a real question
+        if len(msg) <= 4:
+            return True
+
+        # Greeting patterns
+        greetings = [
+            "hi",
+            "hello",
+            "hey",
+            "hiya",
+            "howdy",
+            "good morning",
+            "good afternoon",
+            "good evening",
+            "good day",
+            "what's up",
+            "whats up",
+            "sup",
+            "yo",
+            "greetings",
+            "how are you",
+            "how r u",
+            "how do you do",
+            "nice to meet you",
+        ]
+        for g in greetings:
+            if (
+                msg == g
+                or msg.startswith(g + " ")
+                or msg.startswith(g + "!")
+                or msg.startswith(g + ",")
+            ):
+                return True
+
+        # Pure small talk — no data keywords at all
+        data_keywords = [
+            "how many",
+            "how much",
+            "count",
+            "total",
+            "revenue",
+            "sales",
+            "orders",
+            "customers",
+            "users",
+            "products",
+            "show me",
+            "list",
+            "which",
+            "what is",
+            "what are",
+            "when",
+            "where",
+            "who",
+            "compare",
+            "trend",
+            "report",
+            "data",
+            "analytics",
+            "metric",
+            "average",
+            "top",
+            "best",
+            "worst",
+            "last",
+            "today",
+            "week",
+            "month",
+            "year",
+            "pending",
+            "completed",
+            "projects",
+        ]
+        has_data_intent = any(kw in msg for kw in data_keywords)
+        return not has_data_intent
 
     def _is_handover_request(self, message: str) -> bool:
         message_lower = message.lower()

@@ -1,4 +1,4 @@
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 from google import genai
 from google.genai import types
 from groq import Groq
@@ -16,14 +16,16 @@ class LLMService:
     """
     Unified LLM service with intelligent provider switching.
 
-    Primary:  Gemini (gemini-2.0-flash-exp)
+    Primary:  Gemini
     Fallback: Groq (llama-3.3-70b-versatile)
 
-    Modes:
-      generate_response()           → Standard FAQ/chat responses
-      generate_analytics_response() → Internal "Digital Brain" analytics (NEW)
-      generate_structured_response() → JSON output for SQL generation
-      format_query_results()        → Convert DB results to natural language
+    Point 3 additions:
+      answer_with_sql_context() → grounded follow-up answers using last SQL result
+      generate_analytics_response() → adaptive verbosity based on question complexity
+
+    Point 5C/5D additions:
+      generate_internal_response() → richer BI analyst system prompt for internal users
+      _pick_model_for_user_type() → route internal to best model, external to fast model
     """
 
     def __init__(self):
@@ -31,13 +33,119 @@ class LLMService:
         self.gemini_model = settings.GEMINI_LLM_MODEL
         self.groq_model = settings.GROQ_LLM_MODEL
         self.rate_limiter = rate_limiter
-
         logger.info(
             f"Initialized LLM service — Gemini: {self.gemini_model}, Groq: {self.groq_model}"
         )
 
     def _should_use_groq(self) -> bool:
         return self.rate_limiter.is_rate_limited("gemini")
+
+    def _pick_model_for_user_type(self, user_type: str) -> str:
+        """
+        Point 5D — Multi-Model Routing.
+
+        internal → use the best available model (Gemini preferred, Groq as fallback)
+        external → fast / cost-efficient path (Groq preferred for low latency)
+        """
+        if user_type == "internal":
+            # For analytics queries, use the most capable model available
+            if not self.rate_limiter.is_rate_limited("gemini"):
+                return "gemini"
+            return "groq"
+        else:
+            # External (customer-facing): prefer Groq for speed and cost
+            if not self.rate_limiter.is_rate_limited("groq"):
+                return "groq"
+            return "gemini"
+
+    # ─────────────────────────────────────────────────────────────────
+    # Point 5C — Smarter Internal Prompting
+    # ─────────────────────────────────────────────────────────────────
+
+    async def generate_internal_response(
+        self,
+        message: str,
+        context: List[str],
+        history: str,
+        business_name: str = "",
+        user_role: str = "",
+        recent_insights: str = "",
+    ) -> str:
+        """
+        Point 5C: BI-analyst system prompt for internal staff users.
+
+        Differences from the standard generate_response():
+        - Role: data analyst & business intelligence advisor
+        - Leads with the key metric/number
+        - Adds context vs last period where applicable
+        - Identifies the WHY if detectable
+        - Gives a concrete recommendation
+        - Never gives generic answers — always specific with numbers
+        - Injects recent proactive insights as additional context
+        """
+        try:
+            system_lines = [
+                f"ROLE: You are an expert data analyst and business intelligence advisor"
+                f"{' for ' + business_name if business_name else ''}.",
+                "MODE: Internal Analytics — full unrestricted access.",
+            ]
+            if user_role:
+                system_lines.append(f"USER ROLE: {user_role}")
+
+            system_lines += [
+                "",
+                "When answering questions:",
+                "1. Lead with the key metric/number immediately.",
+                "2. Add context (vs last period, vs target if inferable).",
+                "3. Identify the WHY if detectable from data.",
+                "4. Give a concrete recommendation.",
+                "5. Show what data was queried (transparency).",
+                "",
+                "Rules:",
+                "- Never give generic answers. Always be specific with numbers.",
+                "- If you don't have the data, say so clearly and suggest how to get it.",
+                "- Format numbers with commas. Use ₦, $, € based on context.",
+                "- Use markdown tables for multi-row comparisons.",
+            ]
+
+            if recent_insights:
+                system_lines += ["", recent_insights]
+
+            system_prompt = "\n".join(system_lines)
+
+            context_text = "\n\n".join(context) if context else ""
+            user_content_parts = []
+            if history:
+                user_content_parts.append(f"Conversation history:\n{history}")
+            if context_text:
+                user_content_parts.append(f"Relevant data/knowledge:\n{context_text}")
+            user_content_parts.append(f"Question: {message}")
+
+            messages = [
+                {"role": "system", "content": system_prompt},
+                {"role": "user", "content": "\n\n".join(user_content_parts)},
+            ]
+
+            # Point 5D: use best model for internal queries
+            model_choice = self._pick_model_for_user_type("internal")
+            logger.info(f"Internal response using model: {model_choice}")
+
+            if model_choice == "gemini":
+                try:
+                    reply = await self._generate_with_gemini(messages)
+                    self.rate_limiter.add_request("gemini")
+                    return reply
+                except Exception as e:
+                    logger.warning(
+                        f"Gemini failed for internal, falling back to Groq: {e}"
+                    )
+                    return await self._generate_with_groq(messages)
+            else:
+                return await self._generate_with_groq(messages)
+
+        except Exception as e:
+            logger.error(f"generate_internal_response error: {str(e)}")
+            return "I encountered an error generating the analysis. Please try again."
 
     # ─────────────────────────────────────────────────────────────────
     # Standard response (external users + general FAQ)
@@ -59,9 +167,7 @@ class LLMService:
                 personality=personality,
                 business_overview=business_overview,
             )
-
             use_groq = self._should_use_groq()
-
             if use_groq:
                 logger.info("Using Groq (Gemini rate limited)")
                 reply = await self._generate_with_groq(messages)
@@ -70,21 +176,99 @@ class LLMService:
                 try:
                     reply = await self._generate_with_gemini(messages)
                     self.rate_limiter.add_request("gemini")
-                except Exception as gemini_error:
-                    logger.warning(
-                        f"Gemini failed, falling back to Groq: {str(gemini_error)}"
-                    )
+                except Exception as e:
+                    logger.warning(f"Gemini failed, falling back to Groq: {str(e)}")
                     reply = await self._generate_with_groq(messages)
-
             logger.info(f"Generated response: {reply[:100]}...")
             return reply
-
         except Exception as e:
             logger.error(f"Error generating LLM response: {str(e)}")
             return "I apologize, but I'm having trouble generating a response right now. Please try again."
 
     # ─────────────────────────────────────────────────────────────────
-    # ✅ NEW: Analytics response (internal "Digital Brain" users only)
+    # Point 3: Grounded follow-up answers using last SQL context
+    # ─────────────────────────────────────────────────────────────────
+
+    async def answer_with_sql_context(
+        self,
+        question: str,
+        sql_context: Dict[str, Any],
+        business_overview: str = "",
+    ) -> Optional[str]:
+        """
+        Answer a follow-up question grounded in the previous SQL result.
+
+        Called when:
+        - The previous assistant turn returned SQL data
+        - The current message is a short follow-up with no new SQL keywords
+        - e.g. "which ones use laravel?" after "there are 7 completed projects"
+
+        Returns None if the context isn't helpful (caller falls back to FAQ).
+        """
+        prev_response = sql_context.get("assistant_response", "")
+        row_count = sql_context.get("row_count", 0)
+        explanation = sql_context.get("explanation", "")
+
+        if not prev_response or row_count == 0:
+            return None
+
+        system_prompt = f"""You are a helpful assistant with access to live business data.
+{f"Business context: {business_overview}" if business_overview else ""}
+
+The user just received this data result:
+---
+{prev_response[:600]}
+---
+(This came from a database query: {explanation})
+
+Now they are asking a follow-up question. Answer it using the data shown above.
+- Be direct and specific — use the actual data, not generic statements
+- If the follow-up asks to filter or narrow the previous results, do so
+- If the data genuinely can't answer the follow-up, say so briefly and suggest they ask differently
+- Keep it concise — no boilerplate, no "Strategic Implications"
+"""
+
+        messages = [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": question},
+        ]
+
+        try:
+            if self._should_use_groq():
+                reply = await self._generate_with_groq(messages)
+            else:
+                try:
+                    reply = await self._generate_with_gemini(messages)
+                    self.rate_limiter.add_request("gemini")
+                except Exception:
+                    reply = await self._generate_with_groq(messages)
+
+            # Sanity check — if the LLM says it can't answer, return None
+            cant_answer_signals = [
+                "i don't have",
+                "i cannot",
+                "not available",
+                "no information",
+                "cannot answer",
+                "don't have access",
+                "unable to",
+            ]
+            if any(s in reply.lower()[:150] for s in cant_answer_signals):
+                logger.info(
+                    "answer_with_sql_context: LLM indicated it can't answer, falling back to FAQ"
+                )
+                return None
+
+            logger.info(f"Grounded follow-up answered: {reply[:100]}...")
+            return reply
+
+        except Exception as e:
+            logger.warning(f"answer_with_sql_context failed: {e}")
+            return None
+
+    # ─────────────────────────────────────────────────────────────────
+    # Analytics response (internal "Digital Brain" users)
+    # Point 3: adaptive verbosity — simple questions get concise answers
     # ─────────────────────────────────────────────────────────────────
 
     async def generate_analytics_response(
@@ -96,79 +280,66 @@ class LLMService:
         history: str = "",
         row_count: int = 0,
     ) -> str:
-        """
-        Generate a rich, analytical response for internal (staff/owner) users.
-
-        Unlike format_query_results() which produces a simple summary,
-        this method acts as a business intelligence analyst:
-          - Identifies trends and patterns in the data
-          - Highlights top/bottom performers
-          - Notes anomalies or notable figures
-          - Provides business context and interpretation
-          - Suggests follow-up questions when appropriate
-          - Can comment on what the data implies for strategy
-
-        Args:
-            message:          The original question from the staff member
-            data:             Raw query results from the database
-            sql_explanation:  What the SQL query was doing
-            business_overview: Business context for interpretation
-            history:          Conversation history
-            row_count:        Number of records returned
-
-        Returns:
-            Rich analytical narrative as a string
-        """
         if not data:
             return (
-                "I couldn't find any data matching your query. This could mean:\n"
-                "- The data hasn't been synced yet\n"
-                "- The time range has no records\n"
-                "- The filter criteria didn't match any entries\n\n"
-                "Try adjusting your question or checking a different time period."
+                "No data found for that query. This could mean the records don't exist yet, "
+                "or the filter criteria didn't match anything. Try a different time range or rephrasing."
             )
 
-        # Prepare a rich data summary for the prompt
+        # Point 3: detect question complexity to calibrate response depth
+        is_simple_count = row_count == 1 and any(
+            kw in message.lower() for kw in ("how many", "count", "total", "number of")
+        )
+        is_lookup = row_count <= 5 and any(
+            kw in message.lower()
+            for kw in ("show me", "list", "which", "what", "find", "get")
+        )
+
         data_summary = self._prepare_analytics_summary(data, row_count)
 
-        system_prompt = f"""You are an expert business intelligence analyst and data scientist for an African SME.
-You have access to the company's live database and your job is to help leadership make data-driven decisions.
+        if is_simple_count:
+            # For simple count questions, skip the full BI narrative
+            depth_instruction = (
+                "Give a direct, concise answer with the number. "
+                "Add one insight if it's genuinely interesting (e.g. breakdown by status). "
+                "Skip 'Strategic Implications' and 'Follow-up Questions' unless the data is surprising."
+            )
+        elif is_lookup:
+            # For listing/lookup questions, present the data clearly
+            depth_instruction = (
+                "Present the data clearly and concisely. Highlight the most relevant fields. "
+                "Skip generic business commentary. One follow-up suggestion is fine if relevant."
+            )
+        else:
+            # Complex analytical questions — full BI treatment
+            depth_instruction = (
+                "Provide a thorough analytical response:\n"
+                "1. Direct answer with key figures\n"
+                "2. Trends or patterns in the data\n"
+                "3. Any anomalies worth flagging\n"
+                "4. Brief strategic implication (1-2 sentences)\n"
+                "5. One relevant follow-up question"
+            )
 
-COMPANY CONTEXT:
-{business_overview or "A growing African business looking for operational insights."}
+        system_prompt = f"""You are a business intelligence analyst.
+{f"Business context: {business_overview}" if business_overview else ""}
 
-YOUR ANALYTICAL STYLE:
-- Lead with the most important insight, not with pleasantries
-- Use specific numbers and percentages from the data
-- Identify trends, not just raw figures (e.g. "up 23% vs last quarter")
-- Flag anomalies or outliers worth attention
-- Connect data points to business implications
-- Use clear formatting: bold key figures, use bullet points for comparisons
-- Suggest relevant follow-up questions at the end when appropriate
-- Think like a CFO or COO reviewing a dashboard
-
-IMPORTANT:
-- You have the FULL data — be specific, not vague
-- Never say "I don't have enough information" if the data is right there
-- If the data shows a problem, name it directly
-- Keep responses concise but substantive — no filler sentences
+Style:
+- Lead with the answer, not pleasantries
+- Use specific numbers from the data
+- Bold key figures
+- No filler sentences
+- {depth_instruction}
 """
 
         history_section = f"\nPrevious conversation:\n{history}\n" if history else ""
 
         user_prompt = f"""Question: "{message}"
 
-Data retrieved ({row_count} records):
+Data ({row_count} records):
 {data_summary}
 
 Query context: {sql_explanation}
-
-Provide a clear, analytical answer. Include:
-1. Direct answer to the question with key figures
-2. Notable trends or patterns you observe
-3. Any anomalies or figures worth flagging
-4. Brief strategic implication (1-2 sentences)
-5. One relevant follow-up question they might want to explore next
 {history_section}"""
 
         messages = [
@@ -177,9 +348,7 @@ Provide a clear, analytical answer. Include:
         ]
 
         try:
-            use_groq = self._should_use_groq()
-
-            if use_groq:
+            if self._should_use_groq():
                 logger.info("Using Groq for analytics response")
                 reply = await self._generate_with_groq(messages)
             else:
@@ -196,64 +365,41 @@ Provide a clear, analytical answer. Include:
 
         except Exception as e:
             logger.error(f"Analytics response generation failed: {str(e)}")
-            # Graceful fallback to basic formatting
             return await self.format_query_results(message, data, sql_explanation)
 
     def _prepare_analytics_summary(self, data: List[Dict], row_count: int) -> str:
-        """
-        Prepare a rich data summary for the analytics prompt.
-        Shows full data for small sets, structured summaries for large sets.
-        """
         if not data:
             return "No data returned."
-
         if row_count <= 10:
-            # Show full data as a formatted table
             return f"Full dataset:\n{json.dumps(data, indent=2, default=str)}"
-
         elif row_count <= 50:
-            # Show first 10 + last 5 + summary stats
-            summary_parts = [
+            parts = [
                 f"First 10 records:\n{json.dumps(data[:10], indent=2, default=str)}",
                 f"\nLast 5 records:\n{json.dumps(data[-5:], indent=2, default=str)}",
             ]
-
-            # Try to compute basic stats for numeric columns
             stats = self._compute_basic_stats(data)
             if stats:
-                summary_parts.append(
-                    f"\nAggregate stats:\n{json.dumps(stats, indent=2)}"
-                )
-
-            return "\n".join(summary_parts)
-
+                parts.append(f"\nAggregate stats:\n{json.dumps(stats, indent=2)}")
+            return "\n".join(parts)
         else:
-            # Large dataset — show top/bottom performers + stats
-            summary_parts = [
-                f"Top 10 records:\n{json.dumps(data[:10], indent=2, default=str)}",
-            ]
-
+            parts = [f"Top 10 records:\n{json.dumps(data[:10], indent=2, default=str)}"]
             stats = self._compute_basic_stats(data)
             if stats:
-                summary_parts.append(
+                parts.append(
                     f"\nAggregate stats across all {row_count} records:\n{json.dumps(stats, indent=2)}"
                 )
-
-            return "\n".join(summary_parts)
+            return "\n".join(parts)
 
     def _compute_basic_stats(self, data: List[Dict]) -> Dict[str, Any]:
-        """Compute min/max/sum/avg for numeric columns."""
         if not data:
             return {}
-
         stats = {}
         numeric_cols = [
             k
             for k, v in data[0].items()
             if isinstance(v, (int, float)) and v is not None
         ]
-
-        for col in numeric_cols[:5]:  # Limit to 5 cols
+        for col in numeric_cols[:5]:
             values = [row[col] for row in data if row.get(col) is not None]
             if values:
                 stats[col] = {
@@ -263,7 +409,6 @@ Provide a clear, analytical answer. Include:
                     "avg": round(sum(values) / len(values), 2),
                     "count": len(values),
                 }
-
         return stats
 
     # ─────────────────────────────────────────────────────────────────
@@ -271,36 +416,30 @@ Provide a clear, analytical answer. Include:
     # ─────────────────────────────────────────────────────────────────
 
     async def generate_structured_response(self, prompt: str) -> Dict[str, Any]:
-        system_prompt = """You are a data analysis assistant. 
+        system_prompt = """You are a data analysis assistant.
 Always respond with valid JSON only. No other text before or after the JSON.
 Ensure all JSON is properly formatted with correct quotes and brackets."""
-
         messages = [
             {"role": "system", "content": system_prompt},
             {"role": "user", "content": prompt},
         ]
-
         try:
-            use_groq = self._should_use_groq()
-
-            if use_groq:
+            if self._should_use_groq():
                 reply = await self._generate_with_groq(messages)
             else:
                 try:
                     reply = await self._generate_with_gemini(messages)
                     self.rate_limiter.add_request("gemini")
-                except Exception as gemini_error:
-                    logger.warning(f"Gemini failed, using Groq: {str(gemini_error)}")
+                except Exception as e:
+                    logger.warning(f"Gemini failed, using Groq: {str(e)}")
                     reply = await self._generate_with_groq(messages)
 
             reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
-
             json_match = re.search(r"\{.*\}", reply, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group(0))
-            else:
-                logger.error(f"No JSON found in response: {reply}")
-                return {}
+            logger.error(f"No JSON found in response: {reply}")
+            return {}
 
         except json.JSONDecodeError as e:
             logger.error(f"JSON parsing failed: {str(e)}")
@@ -310,16 +449,12 @@ Ensure all JSON is properly formatted with correct quotes and brackets."""
             return {}
 
     # ─────────────────────────────────────────────────────────────────
-    # Basic query result formatting (external users / simple cases)
+    # External user query formatting
     # ─────────────────────────────────────────────────────────────────
 
     async def format_query_results(
         self, question: str, data: List[Dict], explanation: str
     ) -> str:
-        """
-        Format database results into plain natural language.
-        Used for external users where the response must be customer-friendly.
-        """
         if not data:
             return "I couldn't find any matching records for your request."
 
@@ -331,24 +466,19 @@ Ensure all JSON is properly formatted with correct quotes and brackets."""
                 f"First 3 results: {json.dumps(data[:3], indent=2, default=str)}"
             )
 
-        prompt = f"""Convert this database query result into a natural, conversational response.
+        prompt = f"""Convert this database result into a natural, conversational response.
 
 User Question: "{question}"
 Query Purpose: {explanation}
 Data: {data_summary}
 
-Write a helpful, natural response. Include key information but keep it conversational.
-Do NOT mention table names, column names, or SQL. Speak as if you just know the answer.
-If there are multiple results, summarize them clearly."""
+Write a helpful, natural response. Do NOT mention table names, column names, or SQL.
+Speak as if you just know the answer."""
 
         try:
-            response = await self.generate_response(
-                message=prompt,
-                context=[],
-                history="",
-                personality="helpful and clear",
+            return await self.generate_response(
+                message=prompt, context=[], history="", personality="helpful and clear"
             )
-            return response
         except Exception as e:
             logger.error(f"Query result formatting failed: {str(e)}")
             return f"I found {len(data)} results. {explanation}"
@@ -387,24 +517,16 @@ If there are multiple results, summarize them clearly."""
     # ─────────────────────────────────────────────────────────────────
 
     def _build_messages(
-        self,
-        message: str,
-        context: List[str],
-        history: str,
-        personality: str,
-        business_overview: str = None,
-    ) -> List[dict]:
+        self, message, context, history, personality, business_overview=None
+    ):
         context_text = (
             "\n".join([f"- {ctx}" for ctx in context[:3]])
             if context
             else "No specific context available."
         )
-
         system_prompt = f"You are a {personality} AI assistant for a business.\n"
-
         if business_overview:
             system_prompt += f"\nBUSINESS CONTEXT:\n{business_overview}\n"
-
         system_prompt += f"""
 RELEVANT DATA:
 {context_text}
@@ -416,29 +538,25 @@ Guidelines:
 - Keep responses natural and conversational
 - Do NOT mention database tables, column names, or SQL
 """
-
         messages = [{"role": "system", "content": system_prompt}]
-
         if history:
             messages.append(
                 {"role": "system", "content": f"Previous conversation:\n{history}"}
             )
-
         messages.append({"role": "user", "content": message})
         return messages
 
     def _convert_to_gemini_contents(self, messages: List[dict]) -> str:
-        combined_text = ""
+        combined = ""
         for msg in messages:
-            role = msg.get("role", "")
-            content = msg.get("content", "")
+            role, content = msg.get("role", ""), msg.get("content", "")
             if role == "system":
-                combined_text += f"{content}\n\n"
+                combined += f"{content}\n\n"
             elif role == "user":
-                combined_text += f"User: {content}\n\n"
+                combined += f"User: {content}\n\n"
             elif role == "assistant":
-                combined_text += f"Assistant: {content}\n\n"
-        return combined_text.strip()
+                combined += f"Assistant: {content}\n\n"
+        return combined.strip()
 
     def get_rate_limit_stats(self) -> Dict[str, Any]:
         stats = self.rate_limiter.get_stats()
@@ -446,5 +564,4 @@ Guidelines:
         return stats
 
 
-# Backward compatibility
 LLMServiceHuggingFace = LLMService

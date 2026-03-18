@@ -1,97 +1,131 @@
-from fastapi import APIRouter, HTTPException, Depends, Header
-from app.schemas.analysis import (
-    SchemaAnalysisRequest,
-    SchemaAnalysisResponse,
-    BusinessOverviewRequest,
-    BusinessOverviewResponse,
-    QueryGenerationRequest,
-    QueryGenerationResponse,
+from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
+from typing import Dict, Any, List, Optional
+from app.services.schema_analyzer import (
+    SchemaAnalyzer,
+    BusinessOverviewGenerator,
+    ProfileBuilder,
 )
-from app.services.schema_analyzer import SchemaAnalyzer, BusinessOverviewGenerator
 from app.services.llm import LLMService
-from app.core.config import settings
 from app.core.logging_config import logger
 
 router = APIRouter()
 
-# Initialize services
 llm_service = LLMService()
-schema_analyzer = SchemaAnalyzer(llm_service)
-overview_generator = BusinessOverviewGenerator(llm_service)
+profile_builder = ProfileBuilder(llm_service)
 
 
-def verify_api_key(x_akili_key: str = Header(...)):
-    """Verify API key"""
-    if x_akili_key != settings.FASTAPI_SHARED_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-    return True
+# ── Request / Response models ──────────────────────────────────────────────────
 
 
-@router.post("/schema", response_model=SchemaAnalysisResponse)
-async def analyze_schema(
-    request: SchemaAnalysisRequest, _: bool = Depends(verify_api_key)
-):
-    """Analyze database table schema and detect relationships"""
+class TableProfile(BaseModel):
+    columns: List[Dict[str, Any]]
+    foreign_keys: List[Dict[str, Any]] = []
+    sample_rows: List[Dict[str, Any]] = []
+    enum_hints: Dict[str, List[str]] = {}
+    row_count_estimate: Optional[int] = None
 
+
+class BuildProfileRequest(BaseModel):
+    connection_id: str
+    business_id: str
+    chatbot_id: str
+    database_type: str  # mysql | postgresql | mongodb
+    all_tables: List[Dict[str, Any]]  # [{name, likely_system}]
+    selected_tables: List[str]
+    table_profiles: Dict[str, TableProfile]  # keyed by table name
+
+
+class SchemaAnalysisRequest(BaseModel):
+    """Legacy endpoint — kept for backward compatibility."""
+
+    table: str
+    columns: List[str]
+    all_tables: List[str]
+    task: str = "analyze_schema"
+
+
+class BusinessOverviewRequest(BaseModel):
+    """Legacy endpoint — kept for backward compatibility."""
+
+    schema_analysis: Dict[str, Any]
+    database_type: str
+    table_count: int
+    selected_tables: List[str]
+    task: str = "generate_business_overview"
+
+
+# ── New unified endpoint ───────────────────────────────────────────────────────
+
+
+@router.post("/build-profile")
+async def build_database_profile(request: BuildProfileRequest):
+    """
+    Point 1: Build a rich DatabaseProfile from schema + samples.
+
+    Replaces the old row-embedding approach. Called once during sync.
+    The resulting profile is stored on the DatabaseConnection and passed
+    to the SQL generator at query time — no vector search needed for DB queries.
+    """
     try:
-        logger.info(f"Analyzing schema for table: {request.table}")
-        logger.info(f"Available tables: {request.all_tables}")
-
-        analysis = await schema_analyzer.analyze_table_structure(
-            table=request.table, columns=request.columns, all_tables=request.all_tables
+        logger.info(
+            f"Building database profile for connection {request.connection_id} "
+            f"({len(request.selected_tables)} selected tables)"
         )
 
-        logger.info(f"Schema analysis result: {analysis}")
+        # Convert pydantic models to plain dicts for internal use
+        table_profiles_dict = {
+            table: profile.model_dump()
+            for table, profile in request.table_profiles.items()
+        }
 
-        return SchemaAnalysisResponse(success=True, analysis=analysis)
+        profile = await profile_builder.build(
+            connection_id=request.connection_id,
+            business_id=request.business_id,
+            chatbot_id=request.chatbot_id,
+            database_type=request.database_type,
+            all_tables=request.all_tables,
+            selected_tables=request.selected_tables,
+            table_profiles=table_profiles_dict,
+        )
 
+        return profile
+
+    except Exception as e:
+        logger.error(f"Profile build failed: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Profile build failed: {str(e)}")
+
+
+# ── Legacy endpoints (unchanged — other parts of the system may call these) ───
+
+
+@router.post("/schema")
+async def analyze_schema(request: SchemaAnalysisRequest):
+    """Legacy: analyze a single table's structure."""
+    try:
+        analyzer = SchemaAnalyzer(llm_service)
+        analysis = await analyzer.analyze_table_structure(
+            table=request.table,
+            columns=request.columns,
+            all_tables=request.all_tables,
+        )
+        return {"analysis": analysis}
     except Exception as e:
         logger.error(f"Schema analysis failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
 
 
-@router.post("/business-overview", response_model=BusinessOverviewResponse)
-async def generate_business_overview(
-    request: BusinessOverviewRequest, _: bool = Depends(verify_api_key)
-):
-    """Generate comprehensive business overview from schema"""
-
+@router.post("/business-overview")
+async def generate_business_overview(request: BusinessOverviewRequest):
+    """Legacy: generate business overview from schema analysis."""
     try:
-        logger.info(
-            f"Generating business overview for {request.table_count} tables: "
-            f"{', '.join(request.selected_tables)}"
-        )
-
-        # Validate that schema_analysis contains the selected tables
-        schema_tables = list(request.schema_analysis.get("tables", {}).keys())
-        missing_tables = [t for t in request.selected_tables if t not in schema_tables]
-
-        if missing_tables:
-            logger.warning(
-                f"Some selected tables not in schema_analysis: {missing_tables}"
-            )
-
-        result = await overview_generator.generate_overview(
+        generator = BusinessOverviewGenerator(llm_service)
+        overview = await generator.generate_overview(
             schema_analysis=request.schema_analysis,
             database_type=request.database_type,
-            selected_tables=request.selected_tables,  # Pass explicitly
+            selected_tables=request.selected_tables,
         )
-
-        logger.info(
-            f"Business overview generated successfully. "
-            f"Discovered {len(result.get('discovered_actions', []))} actions."
-        )
-
-        return BusinessOverviewResponse(
-            success=True,
-            overview=result.get("overview", ""),
-            discovered_actions=result.get("discovered_actions", []),
-            analyzed_tables=result.get("analyzed_tables", request.selected_tables),
-        )
-
-    except ValueError as e:
-        logger.error(f"Validation error in business overview: {str(e)}")
-        raise HTTPException(status_code=422, detail=str(e))
+        return overview
     except Exception as e:
         logger.error(f"Business overview generation failed: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))

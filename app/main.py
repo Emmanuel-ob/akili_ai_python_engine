@@ -6,6 +6,7 @@ from app.api.v1 import (
     routes_health,
     routes_analysis,
     routes_faq,
+    routes_intelligence,  # Point 5A + 5B
 )
 from app.core.logging_config import logger
 
@@ -30,8 +31,13 @@ akiliAi.include_router(routes_chat.router, prefix="/api/v1/chat", tags=["Chat"])
 akiliAi.include_router(
     routes_embeddings.router, prefix="/api/v1/embeddings", tags=["Embeddings"]
 )
-akiliAi.include_router(routes_analysis.router, prefix="/api/v1/analyze", tags=["Analysis"])
+akiliAi.include_router(
+    routes_analysis.router, prefix="/api/v1/analyze", tags=["Analysis"]
+)
 akiliAi.include_router(routes_faq.router, prefix="/api/v1/faq", tags=["FAQ"])  # NEW
+akiliAi.include_router(
+    routes_intelligence.router, prefix="/api/v1/intelligence", tags=["Intelligence"]
+)  # Point 5
 
 
 @akiliAi.on_event("startup")
@@ -52,6 +58,7 @@ async def root():
         "features": ["Chat", "Embeddings", "FAQ Management", "Analysis"],
         "docs": "/docs",
     }
+
 
 @akiliAi.get("/ping")
 def health_check():
