@@ -6,8 +6,9 @@ from app.api.v1 import (
     routes_health,
     routes_analysis,
     routes_faq,
-    routes_intelligence,  # Point 5A + 5B
+    routes_intelligence,
 )
+from app.core.config import settings
 from app.core.logging_config import logger
 
 akiliAi = FastAPI(
@@ -16,10 +17,11 @@ akiliAi = FastAPI(
     version="2.0.0",
 )
 
-# CORS
+# Item 10: Restrict CORS to explicit allowed origins from config.
+# allow_origins=["*"] with allow_credentials=True is a browser spec violation and a security risk.
 akiliAi.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=settings.ALLOWED_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -34,14 +36,36 @@ akiliAi.include_router(
 akiliAi.include_router(
     routes_analysis.router, prefix="/api/v1/analyze", tags=["Analysis"]
 )
-akiliAi.include_router(routes_faq.router, prefix="/api/v1/faq", tags=["FAQ"])  # NEW
+akiliAi.include_router(routes_faq.router, prefix="/api/v1/faq", tags=["FAQ"])
 akiliAi.include_router(
     routes_intelligence.router, prefix="/api/v1/intelligence", tags=["Intelligence"]
-)  # Point 5
+)
+
+
+def validate_settings():
+    """
+    Item 3: Refuse to start if any required secret is missing.
+    This prevents the app from running in an insecure state when .env is absent or misconfigured.
+    """
+    required_secrets = {
+        "FASTAPI_SHARED_KEY": settings.FASTAPI_SHARED_KEY,
+        "GEMINI_API_KEY": settings.GEMINI_API_KEY,
+        "POSTGRES_PASSWORD": settings.POSTGRES_PASSWORD,
+        "POSTGRES_USER": settings.POSTGRES_USER,
+    }
+
+    missing = [name for name, value in required_secrets.items() if not value]
+
+    if missing:
+        raise ValueError(
+            f"Missing required environment variables: {', '.join(missing)}. "
+            f"Check your .env file — the application will not start without these values set."
+        )
 
 
 @akiliAi.on_event("startup")
 async def startup_event():
+    validate_settings()  # Item 3: hard-fail on missing secrets
     logger.info("Akili AI Engine started successfully with FAQ support")
 
 

@@ -100,6 +100,18 @@ class ChatService:
             business_overview = chatbot_config.get("business_overview", "")
             handoff_enabled = chatbot_config.get("handoff_to_human", False)
 
+            # Item 7: Inject chatbot_type persona prefix so the LLM adopts the right role and tone.
+            # This runs for external (customer-facing) users only — internal/dashboard users get
+            # unrestricted analyst mode regardless of chatbot_type.
+            if user_type == "external":
+                chatbot_type = chatbot_config.get("chatbot_type", "general")
+                type_persona_prefix = self._get_type_persona(chatbot_type)
+                if type_persona_prefix and business_overview:
+                    business_overview = f"{type_persona_prefix}\n\n{business_overview}"
+                elif type_persona_prefix:
+                    business_overview = type_persona_prefix
+                chatbot_config["business_overview"] = business_overview
+
             # Handover detection (only relevant for external users)
             if (
                 user_type == "external"
@@ -835,6 +847,30 @@ class ChatService:
         ]
         has_data_intent = any(kw in msg for kw in data_keywords)
         return not has_data_intent
+
+    def _get_type_persona(self, chatbot_type: str) -> str:
+        """
+        Item 7: Returns a system prompt prefix based on the chatbot type.
+        This shapes the AI's focus and tone without overriding the business's
+        custom personality or FAQ knowledge.
+        """
+        personas = {
+            "customer_service": (
+                "You are a customer service specialist. Your priorities are: "
+                "resolving the customer's issue quickly and clearly, showing empathy when they are frustrated, "
+                "providing actionable next steps, and escalating to a human agent when the issue is beyond your scope. "
+                "Keep responses concise and solution-focused. Never make the customer feel dismissed."
+            ),
+            "sales": (
+                "You are a knowledgeable sales assistant. Your priorities are: "
+                "understanding what the customer is looking for, clearly communicating product benefits relevant to their needs, "
+                "addressing objections with honest and confident answers, and guiding interested customers toward "
+                "the next step (demo, free trial, or speaking with the team). "
+                "Be enthusiastic but never pushy."
+            ),
+            "general": "",  # No prefix — default behaviour
+        }
+        return personas.get(chatbot_type, "")
 
     def _is_handover_request(self, message: str) -> bool:
         message_lower = message.lower()
