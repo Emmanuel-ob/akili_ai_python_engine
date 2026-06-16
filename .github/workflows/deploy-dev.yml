@@ -1,0 +1,27 @@
+name: Deploy Engine to EC2 (DEV)
+
+on:
+  push:
+    branches:
+      - dev
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.AWS_KEY }}" > ~/.ssh/id_rsa
+          chmod 600 ~/.ssh/id_rsa
+          ssh-keyscan -H ${{ secrets.AWS_HOST }} >> ~/.ssh/known_hosts
+
+      - name: Deploy DEV
+        run: |
+          ssh ${{ secrets.AWS_USER }}@${{ secrets.AWS_HOST }} << 'EOF'
+            cd /var/www/xeliai_engine_dev
+            git pull origin dev
+            /var/www/xeliai_engine_dev/venv/bin/pip install -r requirements.txt
+            /var/www/xeliai_engine_dev/venv/bin/pip install gunicorn
+            sudo systemctl restart xeliai-dev
+          EOF
