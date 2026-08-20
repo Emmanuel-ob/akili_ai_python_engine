@@ -733,6 +733,10 @@ class ChatService:
             history=history_text,
             personality="friendly and helpful",
             business_overview=business_overview,
+            # The only path with no retrieved context to be faithful to, so it
+            # keeps the warmer setting. Every other path inherits the grounded
+            # default, where creative phrasing is the hallucination.
+            temperature=settings.TEMPERATURE_CONVERSATIONAL,
         )
         return ChatResponse(
             text=response_text, sources=[], metadata={"type": "general_chat"}

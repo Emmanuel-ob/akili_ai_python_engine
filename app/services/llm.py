@@ -5,6 +5,7 @@ from groq import Groq
 from app.core.config import settings
 from app.core.logging_config import logger
 from app.services.rate_limiter import rate_limiter
+from app.services.llm_provider import choose_provider, generate_bedrock
 import re
 import json
 
@@ -25,7 +26,7 @@ class LLMService:
 
     Point 5C/5D additions:
       generate_internal_response() → richer BI analyst system prompt for internal users
-      _pick_model_for_user_type() → route internal to best model, external to fast model
+      _dispatch() → single provider-selection point for every generation path
     """
 
     def __init__(self):
@@ -40,23 +41,6 @@ class LLMService:
     def _should_use_groq(self) -> bool:
         return self.rate_limiter.is_rate_limited("gemini")
 
-    def _pick_model_for_user_type(self, user_type: str) -> str:
-        """
-        Point 5D — Multi-Model Routing.
-
-        internal → use the best available model (Gemini preferred, Groq as fallback)
-        external → fast / cost-efficient path (Groq preferred for low latency)
-        """
-        if user_type == "internal":
-            # For analytics queries, use the most capable model available
-            if not self.rate_limiter.is_rate_limited("gemini"):
-                return "gemini"
-            return "groq"
-        else:
-            # External (customer-facing): prefer Groq for speed and cost
-            if not self.rate_limiter.is_rate_limited("groq"):
-                return "groq"
-            return "gemini"
 
     # ─────────────────────────────────────────────────────────────────
     # Point 5C — Smarter Internal Prompting
@@ -126,22 +110,9 @@ class LLMService:
                 {"role": "user", "content": "\n\n".join(user_content_parts)},
             ]
 
-            # Point 5D: use best model for internal queries
-            model_choice = self._pick_model_for_user_type("internal")
-            logger.info(f"Internal response using model: {model_choice}")
-
-            if model_choice == "gemini":
-                try:
-                    reply = await self._generate_with_gemini(messages)
-                    self.rate_limiter.add_request("gemini")
-                    return reply
-                except Exception as e:
-                    logger.warning(
-                        f"Gemini failed for internal, falling back to Groq: {e}"
-                    )
-                    return await self._generate_with_groq(messages)
-            else:
-                return await self._generate_with_groq(messages)
+            # Internal BI answers are grounded in retrieved reports and SQL
+            # results, so they take the grounded temperature like any other.
+            return await self._dispatch(messages, settings.TEMPERATURE_GROUNDED)
 
         except Exception as e:
             logger.error(f"generate_internal_response error: {str(e)}")
@@ -158,8 +129,16 @@ class LLMService:
         history: str,
         personality: str = "helpful and professional",
         business_overview: str = None,
+        temperature: Optional[float] = None,
     ) -> str:
         try:
+            # Default to grounded. Callers doing small talk pass the
+            # conversational value explicitly; everything else in this engine
+            # answers from retrieved context, where creative phrasing is
+            # exactly the failure mode.
+            if temperature is None:
+                temperature = settings.TEMPERATURE_GROUNDED
+
             messages = self._build_messages(
                 message=message,
                 context=context,
@@ -167,18 +146,7 @@ class LLMService:
                 personality=personality,
                 business_overview=business_overview,
             )
-            use_groq = self._should_use_groq()
-            if use_groq:
-                logger.info("Using Groq (Gemini rate limited)")
-                reply = await self._generate_with_groq(messages)
-            else:
-                logger.info("Using Gemini (primary)")
-                try:
-                    reply = await self._generate_with_gemini(messages)
-                    self.rate_limiter.add_request("gemini")
-                except Exception as e:
-                    logger.warning(f"Gemini failed, falling back to Groq: {str(e)}")
-                    reply = await self._generate_with_groq(messages)
+            reply = await self._dispatch(messages, temperature)
             logger.info(f"Generated response: {reply[:100]}...")
             return reply
         except Exception as e:
@@ -234,14 +202,7 @@ Now they are asking a follow-up question. Answer it using the data shown above.
         ]
 
         try:
-            if self._should_use_groq():
-                reply = await self._generate_with_groq(messages)
-            else:
-                try:
-                    reply = await self._generate_with_gemini(messages)
-                    self.rate_limiter.add_request("gemini")
-                except Exception:
-                    reply = await self._generate_with_groq(messages)
+            reply = await self._dispatch(messages, settings.TEMPERATURE_GROUNDED)
 
             # Sanity check — if the LLM says it can't answer, return None
             cant_answer_signals = [
@@ -348,17 +309,7 @@ Query context: {sql_explanation}
         ]
 
         try:
-            if self._should_use_groq():
-                logger.info("Using Groq for analytics response")
-                reply = await self._generate_with_groq(messages)
-            else:
-                logger.info("Using Gemini for analytics response")
-                try:
-                    reply = await self._generate_with_gemini(messages)
-                    self.rate_limiter.add_request("gemini")
-                except Exception as e:
-                    logger.warning(f"Gemini failed for analytics, using Groq: {str(e)}")
-                    reply = await self._generate_with_groq(messages)
+            reply = await self._dispatch(messages, settings.TEMPERATURE_GROUNDED)
 
             logger.info(f"Analytics response generated: {reply[:100]}...")
             return reply
@@ -424,15 +375,7 @@ Ensure all JSON is properly formatted with correct quotes and brackets."""
             {"role": "user", "content": prompt},
         ]
         try:
-            if self._should_use_groq():
-                reply = await self._generate_with_groq(messages)
-            else:
-                try:
-                    reply = await self._generate_with_gemini(messages)
-                    self.rate_limiter.add_request("gemini")
-                except Exception as e:
-                    logger.warning(f"Gemini failed, using Groq: {str(e)}")
-                    reply = await self._generate_with_groq(messages)
+            reply = await self._dispatch(messages, settings.TEMPERATURE_GROUNDED)
 
             reply = re.sub(r"<think>.*?</think>", "", reply, flags=re.DOTALL).strip()
             json_match = re.search(r"\{.*\}", reply, re.DOTALL)
@@ -487,25 +430,75 @@ Speak as if you just know the answer."""
     # Provider implementations
     # ─────────────────────────────────────────────────────────────────
 
-    async def _generate_with_gemini(self, messages: List[dict]) -> str:
+    async def _dispatch(self, messages: List[dict], temperature: float) -> str:
+        """Single provider-selection point for every generation path.
+
+        This logic used to be copy-pasted into five methods, which is how the
+        engine ended up with a hardcoded 0.7 in two places and no single point
+        at which a provider could be switched. Groq is the last resort on
+        every path, so a provider outage degrades rather than fails.
+        """
+        provider = choose_provider(
+            settings.LLM_PROVIDER,
+            gemini_rate_limited=self._should_use_groq(),
+        )
+        logger.info(f"Generating with provider: {provider} (temp={temperature})")
+
+        if provider == "bedrock":
+            try:
+                return await self._generate_with_bedrock(messages, temperature)
+            except Exception as e:
+                logger.warning(f"Bedrock failed, falling back to Groq: {str(e)}")
+                return await self._generate_with_groq(messages, temperature)
+
+        if provider == "groq":
+            return await self._generate_with_groq(messages, temperature)
+
+        try:
+            reply = await self._generate_with_gemini(messages, temperature)
+            self.rate_limiter.add_request("gemini")
+            return reply
+        except Exception as e:
+            logger.warning(f"Gemini failed, falling back to Groq: {str(e)}")
+            return await self._generate_with_groq(messages, temperature)
+
+    async def _generate_with_bedrock(
+        self, messages: List[dict], temperature: float
+    ) -> str:
+        try:
+            return generate_bedrock(
+                messages=messages,
+                model=settings.BEDROCK_LLM_MODEL,
+                region=settings.AWS_REGION,
+                temperature=temperature,
+            )
+        except Exception as e:
+            logger.error(f"Bedrock generation failed: {str(e)}")
+            raise
+
+    async def _generate_with_gemini(
+        self, messages: List[dict], temperature: float
+    ) -> str:
         try:
             contents = self._convert_to_gemini_contents(messages)
             response = self.client.models.generate_content(
                 model=self.gemini_model,
                 contents=contents,
-                config=types.GenerateContentConfig(temperature=0.7),
+                config=types.GenerateContentConfig(temperature=temperature),
             )
             return response.text.strip()
         except Exception as e:
             logger.error(f"Gemini generation failed: {str(e)}")
             raise
 
-    async def _generate_with_groq(self, messages: List[dict]) -> str:
+    async def _generate_with_groq(
+        self, messages: List[dict], temperature: float
+    ) -> str:
         try:
             response = groq_client.chat.completions.create(
                 model=self.groq_model,
                 messages=messages,
-                temperature=0.7,
+                temperature=temperature,
             )
             return response.choices[0].message.content.strip()
         except Exception as e:
@@ -560,7 +553,12 @@ Guidelines:
 
     def get_rate_limit_stats(self) -> Dict[str, Any]:
         stats = self.rate_limiter.get_stats()
-        stats["current_provider"] = "groq" if self._should_use_groq() else "gemini"
+        # Must reflect the same decision _dispatch makes, or this reports a
+        # provider that is not actually serving traffic.
+        stats["current_provider"] = choose_provider(
+            settings.LLM_PROVIDER,
+            gemini_rate_limited=self._should_use_groq(),
+        )
         return stats
 
 
