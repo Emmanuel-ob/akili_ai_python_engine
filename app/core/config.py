@@ -36,6 +36,29 @@ class Settings:
     GEMINI_LLM_MODEL: str = os.getenv("GEMINI_LLM_MODEL", "gemini-2.5-flash")
     GROQ_LLM_MODEL: str = os.getenv("GROQ_LLM_MODEL", "llama-3.3-70b-versatile")
 
+    # ── Generation provider (Engine Revamp Phase 2) ──────────────────────
+    # 'bedrock' | 'gemini'. Bedrock Nova Lite is the target; gemini remains
+    # reachable by env var as the rollback path, with no deploy required.
+    LLM_PROVIDER: str = os.getenv("LLM_PROVIDER", "bedrock")
+
+    # Bedrock model id. If Bedrock reports "on-demand throughput isn't
+    # supported", switch to the cross-region inference profile WITHOUT a code
+    # change: BEDROCK_LLM_MODEL=us.amazon.nova-lite-v1:0
+    BEDROCK_LLM_MODEL: str = os.getenv("BEDROCK_LLM_MODEL", "amazon.nova-lite-v1:0")
+    AWS_REGION: str = os.getenv("AWS_REGION", "us-east-1")
+
+    # Two temperatures, because the engine has two kinds of work.
+    #
+    # Grounded: the model is reproducing facts already retrieved from a
+    # knowledge base or a SQL result. Creative phrasing here IS the
+    # hallucination. Near zero.
+    #
+    # Conversational: greetings and small talk, where a fixed reply reads
+    # robotic. The engine shipped with 0.7 on BOTH, which is why grounded
+    # answers drift from their sources.
+    TEMPERATURE_GROUNDED: float = float(os.getenv("TEMPERATURE_GROUNDED", "0.1"))
+    TEMPERATURE_CONVERSATIONAL: float = float(os.getenv("TEMPERATURE_CONVERSATIONAL", "0.7"))
+
     # Rate Limiting Config
     GEMINI_RATE_LIMIT: int = int(os.getenv("GEMINI_RATE_LIMIT", "14"))
     RATE_LIMIT_WINDOW: int = 60
