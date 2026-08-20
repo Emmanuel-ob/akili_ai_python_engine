@@ -87,6 +87,26 @@ class Settings:
     CHUNK_SIZE: int = int(os.getenv("CHUNK_SIZE", "500"))
     CHUNK_OVERLAP: int = int(os.getenv("CHUNK_OVERLAP", "50"))
 
+    # Chunks below this length are merged into a neighbour. Headings, labels
+    # and list items otherwise become their own ~30-character chunk, each
+    # costing an embedding call and producing a near-useless vector.
+    CHUNK_MIN_SIZE: int = int(os.getenv("CHUNK_MIN_SIZE", "150"))
+
+    # How many chunks per embedding request. The client previously sent an
+    # entire document in one call, so a large upload was a single enormous
+    # request that failed as a unit.
+    EMBED_BATCH_SIZE: int = int(os.getenv("EMBED_BATCH_SIZE", "32"))
+
+    # Hard cap on characters sent to the embedding model. One pathological
+    # chunk (a dense table, an index, an equation dump) can exceed the model's
+    # context window and fail on every retry, taking the whole document with
+    # it. The FULL chunk is still stored and returned; only the vector input
+    # is truncated.
+    EMBED_MAX_INPUT_CHARS: int = int(os.getenv("EMBED_MAX_INPUT_CHARS", "6000"))
+
+    # Retries for transient failures, with exponential backoff.
+    EMBED_RETRIES: int = max(1, int(os.getenv("EMBED_RETRIES", "3")))
+
     # Chat Configuration
     MAX_HISTORY_LENGTH: int = 10
 
