@@ -3,6 +3,7 @@ from google import genai
 from google.genai import types
 from app.core.config import settings
 from app.core.logging_config import logger
+from app.services.embedding_resilience import batch_texts, cap_input, with_retry
 
 
 class EmbeddingService:
@@ -44,18 +45,26 @@ class EmbeddingService:
 
             logger.info(f"Generating embeddings for {len(texts)} texts using Gemini")
 
-            # New SDK: Use embed_content with batch of texts
-            result = self.client.models.embed_content(
-                model=self.model,
-                contents=texts,
-                config=types.EmbedContentConfig(
-                    task_type="RETRIEVAL_DOCUMENT",  # For storing in vector DB
-                    output_dimensionality=settings.EMBEDDING_SIZE,  # 768
-                ),
-            )
-
-            # Extract embeddings from result
-            embeddings = [emb.values for emb in result.embeddings]
+            # Batch rather than sending the whole list as one request. A large
+            # document was previously a single enormous call that failed as a
+            # unit; now one bad batch loses a batch, and each text inside it
+            # is capped and retried individually.
+            embeddings = []
+            for batch in batch_texts(texts, settings.EMBED_BATCH_SIZE):
+                capped = [cap_input(t, settings.EMBED_MAX_INPUT_CHARS) for t in batch]
+                result = with_retry(
+                    lambda payload: self.client.models.embed_content(
+                        model=self.model,
+                        contents=payload,
+                        config=types.EmbedContentConfig(
+                            task_type="RETRIEVAL_DOCUMENT",
+                            output_dimensionality=settings.EMBEDDING_SIZE,  # 768
+                        ),
+                    ),
+                    capped,
+                    retries=settings.EMBED_RETRIES,
+                )
+                embeddings.extend(emb.values for emb in result.embeddings)
 
             logger.info(f"Successfully generated {len(embeddings)} embeddings")
 
@@ -72,23 +81,40 @@ class EmbeddingService:
             raise
 
     def generate_single_embedding(self, text: str) -> List[float]:
-        """
-        Generate embedding for a single text
+        """Embed one chunk, with an input cap and retries.
 
-        Args:
-            text: Text string to embed
+        The cap and the retry loop are the difference between one bad chunk
+        failing and one bad chunk taking an entire document with it. See
+        app/services/embedding_resilience.py for why an over-length rejection
+        is retried by shrinking rather than by waiting.
 
-        Returns:
-            Embedding vector (list of floats)
+        Only the VECTOR input is capped; the full chunk text is stored
+        unchanged by the caller, so no answer content is lost.
         """
+        if not isinstance(text, str):
+            raise ValueError(f"Expected string input, got {type(text)}")
+        if not text.strip():
+            raise ValueError("Empty text input")
+
+        return with_retry(
+            self._embed_once,
+            cap_input(text, settings.EMBED_MAX_INPUT_CHARS),
+            retries=settings.EMBED_RETRIES,
+        )
+
+    def get_provider_info(self) -> dict:
+        """Provider and model that produced a vector.
+
+        Stored on every embedded row so a future provider change is
+        diagnosable: vectors from two different models are not comparable, and
+        without provenance a mixed collection degrades silently. Matches the
+        shape Trivia records, so the two products stay consistent.
+        """
+        return {"provider": "gemini", "model": self.model}
+
+    def _embed_once(self, text: str) -> List[float]:
+        """One raw embedding call. Raises; retry policy lives in the caller."""
         try:
-            # Validate input
-            if not isinstance(text, str):
-                raise ValueError(f"Expected string input, got {type(text)}")
-
-            if not text.strip():
-                raise ValueError("Empty text input")
-
             logger.info(f"Generating single embedding for text length: {len(text)}")
 
             # Generate embedding using new SDK
