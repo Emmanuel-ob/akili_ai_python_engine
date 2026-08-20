@@ -1,3 +1,4 @@
+import asyncio
 from typing import List, Dict, Any, Optional, Literal
 from app.schemas.chat import ChatResponse, HistoryMessage, SourceDocument
 from app.services.vectorstore import VectorStoreService
@@ -5,6 +6,7 @@ from app.services.embeddings import EmbeddingService
 from app.services.llm import LLMService
 from app.services.conversation_memory import ConversationMemory, ConversationSummarizer
 from app.services.query_classifier import QueryClassifier
+from app.services.intent_router import DEFAULT_INTENT, classify as classify_intent
 from app.services.sql_generator import SQLGenerator
 from app.services.sql_validator import SQLValidator
 from app.services.sql_executor import DirectSQLExecutor
@@ -52,24 +54,6 @@ class ChatService:
         self.sql_generator = SQLGenerator(llm_service)
         self.config_cache = ConfigCache()
 
-        self.handover_keywords = [
-            "human",
-            "agent",
-            "person",
-            "representative",
-            "support",
-            "speak to someone",
-            "talk to someone",
-            "real person",
-            "live chat",
-            "live agent",
-            "customer service",
-            "operator",
-            "help desk",
-            "escalate",
-            "supervisor",
-            "manager",
-        ]
 
     # ─────────────────────────────────────────────────────────────────
     # Main entry point
@@ -112,23 +96,6 @@ class ChatService:
                 elif type_persona_prefix:
                     business_overview = type_persona_prefix
                 chatbot_config["business_overview"] = business_overview
-
-            # Handover detection (only relevant for external users)
-            if (
-                user_type == "external"
-                and handoff_enabled
-                and self._is_handover_request(message)
-            ):
-                logger.info("Handover request detected (external user)")
-                return ChatResponse(
-                    text="I understand you'd like to speak with a human agent. Let me connect you with someone from our team.",
-                    sources=[],
-                    metadata={
-                        "type": "handover_request",
-                        "confidence": 1.0,
-                        "handover_requested": True,
-                    },
-                )
 
             # Cache database config from payload
             connection_id = chatbot_config.get("connection_id")
@@ -197,15 +164,34 @@ class ChatService:
 
             has_database = bool(connection_id and schema_analysis and database_config)
 
-            # Point 3: pass recent history for context-aware routing
-            route = QueryClassifier.classify(
-                message,
-                has_database,
-                recent_history=[
-                    m.dict() if hasattr(m, "dict") else m for m in (history or [])
-                ],
-            )
+            # ONE classifier call decides both routing and handover, so the
+            # two can never disagree about the same message. Previously each
+            # ran its own substring keyword match, and "contact" appeared in
+            # both lists at once.
+            #
+            # boto3 blocks, so this runs in a threadpool. Timing out or
+            # failing yields DEFAULT_INTENT: route FAQ, no handover.
+            intent = await self._classify_intent(message, history, has_database)
+            route = intent["route"]
             logger.info(f"Query route: {route}, user_type: {user_type}")
+
+            # Handover is external-only and requires the business to have
+            # enabled it. An uncertain classification never hands over: see
+            # the confidence gate in intent_router._normalise.
+            if user_type == "external" and handoff_enabled and intent["wants_human"]:
+                logger.info(
+                    f"Handover requested (confidence {intent['confidence']}): "
+                    f"{intent['reason']}"
+                )
+                return ChatResponse(
+                    text="I understand you'd like to speak with a human agent. Let me connect you with someone from our team.",
+                    sources=[],
+                    metadata={
+                        "type": "handover_request",
+                        "confidence": intent["confidence"],
+                        "handover_requested": True,
+                    },
+                )
 
             # ─────────────────────────────────────────────────
             # Route to appropriate handler
@@ -746,6 +732,46 @@ class ChatService:
     # Helpers
     # ─────────────────────────────────────────────────────────────────
 
+    async def _classify_intent(
+        self, message: str, history, has_database: bool
+    ) -> Dict[str, Any]:
+        """Classify one message: which source answers it, and does the customer
+        want a person.
+
+        Runs in a threadpool because boto3 is synchronous and this sits on the
+        critical path of every reply; awaiting it directly would stall the
+        worker for the whole round trip.
+
+        Bounded by INTENT_TIMEOUT_SECONDS. On timeout, failure, or the router
+        being disabled, returns DEFAULT_INTENT: route FAQ, no handover. A
+        classifier outage must never start ejecting customers into a queue.
+        """
+        if not settings.INTENT_ROUTER_ENABLED:
+            return DEFAULT_INTENT
+
+        turns = [m.dict() if hasattr(m, "dict") else m for m in (history or [])]
+
+        try:
+            return await asyncio.wait_for(
+                asyncio.get_running_loop().run_in_executor(
+                    None,
+                    classify_intent,
+                    message,
+                    turns,
+                    has_database,
+                    settings.INTENT_ROUTER_MODEL,
+                    settings.AWS_REGION,
+                    settings.INTENT_CONFIDENCE_THRESHOLD,
+                ),
+                timeout=settings.INTENT_TIMEOUT_SECONDS,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                f"Intent router exceeded {settings.INTENT_TIMEOUT_SECONDS}s; "
+                f"using the safe default"
+            )
+            return DEFAULT_INTENT
+
     def _profile_to_schema(self, profile: dict) -> dict:
         """
         Point 1: Convert DatabaseProfile to the schema dict SQLGenerator expects.
@@ -876,37 +902,6 @@ class ChatService:
             "general": "",  # No prefix — default behaviour
         }
         return personas.get(chatbot_type, "")
-
-    def _is_handover_request(self, message: str) -> bool:
-        message_lower = message.lower()
-
-        for keyword in self.handover_keywords:
-            if keyword in message_lower:
-                negative_indicators = ["no", "not", "don't", "without"]
-                has_negation = any(neg in message_lower for neg in negative_indicators)
-                if not has_negation:
-                    logger.info(f"Handover keyword detected: {keyword}")
-                    return True
-
-        handover_phrases = [
-            "speak with",
-            "talk to",
-            "connect me",
-            "transfer me",
-            "chat with",
-            "contact",
-            "i need help from",
-            "can i speak",
-            "is there someone",
-            "get a person",
-        ]
-
-        for phrase in handover_phrases:
-            if phrase in message_lower:
-                logger.info(f"Handover phrase detected: {phrase}")
-                return True
-
-        return False
 
     def _format_history(self, history) -> str:
         if not history:

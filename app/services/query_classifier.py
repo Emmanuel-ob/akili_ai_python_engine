@@ -1,188 +1,44 @@
-from typing import Literal, List, Dict, Any, Optional
-from app.core.logging_config import logger
+"""
+Conversation-history helpers.
 
-QueryRoute = Literal["FAQ", "SQL", "HYBRID"]
+Engine Revamp Phase 3 removed this module's keyword classifier. Routing is now
+decided by app/services/intent_router.py, which asks a model what the message
+means instead of counting substring matches.
+
+What was deleted and why it could not be repaired in place:
+
+  SQL_KEYWORDS / FAQ_KEYWORDS  Routing summed substring hits from two
+      hand-written lists. "order" matched "in order to". "last" matched "last
+      time". "contact" sat in the FAQ list while also being a handover
+      keyword, so one word pulled the same message two ways at once. Adding
+      word boundaries would have fixed the substring cases and left the
+      deeper problem: word presence is not meaning.
+
+  FOLLOWUP_SIGNALS  A list of phrases like "which ones" used to detect a
+      follow-up to a previous data answer. The router sees the recent
+      conversation directly, so it resolves follow-ups from context rather
+      than from a phrasebook.
+
+extract_last_sql_context survives because it reads conversation METADATA that
+the engine itself wrote, not the customer's wording. That is a lookup, not a
+guess, and _handle_faq_query still depends on it.
+"""
+
+from typing import Any, Dict, List, Optional
 
 
 class QueryClassifier:
-    """
-    Routes user queries to FAQ, SQL, or HYBRID.
-
-    Point 3 upgrade: context-aware routing.
-    Receives recent conversation history so it can detect follow-up
-    questions that reference a previous SQL result — even when the
-    follow-up message itself contains no SQL keywords.
-    """
-
-    SQL_KEYWORDS = [
-        "how many",
-        "count",
-        "total",
-        "sum",
-        "average",
-        "avg",
-        "show me",
-        "list",
-        "find",
-        "get",
-        "fetch",
-        "retrieve",
-        "recent",
-        "last",
-        "latest",
-        "status of",
-        "order",
-        "invoice",
-        "transaction",
-        "compare",
-        "breakdown",
-        "distribution",
-        "trend",
-        "top",
-        "bottom",
-        "most",
-        "least",
-        "highest",
-        "lowest",
-        "which ones",
-        "which projects",
-        "what projects",
-        "what orders",
-        "who has",
-        "who are",
-        "when was",
-        "when did",
-    ]
-
-    FAQ_KEYWORDS = [
-        "how to",
-        "what is",
-        "policy",
-        "refund",
-        "return",
-        "shipping",
-        "contact",
-        "hours",
-        "location",
-        "about",
-        "explain",
-        "describe",
-        "tell me about",
-        "what does",
-    ]
-
-    # Phrases that signal a follow-up to a previous data result
-    FOLLOWUP_SIGNALS = [
-        "which ones",
-        "show me those",
-        "can you show",
-        "list them",
-        "tell me more",
-        "more details",
-        "what about",
-        "and what",
-        "any of those",
-        "give me two",
-        "give me some",
-        "pick two",
-        "which of those",
-        "from those",
-        "of those",
-        "among those",
-        "from the",
-        "of the",
-        "break it down",
-        "which one",
-        "now show",
-        "now list",
-        "also show",
-        "what are they",
-        "can you tell me which",
-        "i want to see",
-        "let me see",
-    ]
-
-    @staticmethod
-    def classify(
-        query: str,
-        has_database: bool = False,
-        recent_history: Optional[List[Dict[str, Any]]] = None,
-    ) -> QueryRoute:
-        """
-        Classify query into FAQ, SQL, or HYBRID.
-
-        Args:
-            query:          User's question
-            has_database:   Whether chatbot has database connected
-            recent_history: Last N messages [{role, message, metadata}]
-                            Used to detect follow-ups to SQL results.
-        """
-        if not has_database:
-            return "FAQ"
-
-        query_lower = query.lower().strip()
-
-        sql_score = sum(1 for kw in QueryClassifier.SQL_KEYWORDS if kw in query_lower)
-        faq_score = sum(1 for kw in QueryClassifier.FAQ_KEYWORDS if kw in query_lower)
-
-        # ── Point 3: Context boost ────────────────────────────────────────────
-        # If the previous assistant turn was a SQL/hybrid result, check whether
-        # this message is a natural follow-up that should also hit the database.
-        context_sql_boost = 0
-        last_sql_data = None
-
-        if recent_history:
-            last_assistant = next(
-                (m for m in reversed(recent_history) if m.get("role") == "assistant"),
-                None,
-            )
-            if last_assistant:
-                meta = last_assistant.get("metadata") or {}
-                last_type = meta.get("type", "")
-
-                if last_type in ("sql", "hybrid"):
-                    # Previous turn had data — check if this is a follow-up
-                    is_followup = any(
-                        sig in query_lower for sig in QueryClassifier.FOLLOWUP_SIGNALS
-                    )
-                    # Also boost for very short messages (≤6 words) after SQL
-                    # e.g. "which ones?", "show me those", "and fastapi?"
-                    is_short_followup = len(query_lower.split()) <= 6
-
-                    if is_followup or (
-                        is_short_followup and sql_score == 0 and faq_score == 0
-                    ):
-                        context_sql_boost = 2
-                        logger.info(
-                            f"Context boost applied: previous turn was {last_type}, "
-                            f"detected follow-up query"
-                        )
-
-                    # Store last SQL data for context injection (used by chat.py)
-                    if meta.get("row_count", 0) > 0:
-                        last_sql_data = meta
-
-        effective_sql_score = sql_score + context_sql_boost
-
-        logger.info(
-            f"Query classification - SQL score: {sql_score} (+{context_sql_boost} context boost = {effective_sql_score}), "
-            f"FAQ score: {faq_score}"
-        )
-
-        if effective_sql_score > 0 and faq_score > 0:
-            return "HYBRID"
-        elif effective_sql_score > 0:
-            return "SQL"
-        else:
-            return "FAQ"
+    """Retained for extract_last_sql_context. The classifier is gone."""
 
     @staticmethod
     def extract_last_sql_context(
         recent_history: Optional[List[Dict[str, Any]]],
     ) -> Optional[Dict]:
-        """
-        Extract the most recent SQL result metadata from history.
-        Used by chat.py to inject data context into FAQ follow-up responses.
+        """Find the most recent assistant turn that returned rows.
+
+        Used to answer a short follow-up ("which ones?") from the data already
+        fetched, instead of running a second query. Reads metadata the engine
+        attached to its own earlier reply, so there is no guessing involved.
         """
         if not recent_history:
             return None
