@@ -46,8 +46,26 @@ class Settings:
 
     # Chat Configuration
     MAX_HISTORY_LENGTH: int = 10
-    DEFAULT_SEARCH_LIMIT: int = 5
-    MIN_CONFIDENCE_THRESHOLD: float = 0.5
+
+    # How many chunks to pull from the vector store per query, before gating.
+    DEFAULT_SEARCH_LIMIT: int = int(os.getenv("DEFAULT_SEARCH_LIMIT", "5"))
+
+    # Minimum cosine similarity for a chunk to be treated as relevant.
+    #
+    # Env-overridable so this can be tuned in production without a deploy. It
+    # is the single most sensitive knob in the retrieval path: too low and the
+    # model is handed near-random context and answers confidently from it (the
+    # engine shipped with an effective 0.20 for exactly this reason); too high
+    # and the bot says it does not know things it actually knows.
+    #
+    # Tune against real conversation logs, not by intuition.
+    #
+    # Shipping at 0.35 deliberately. The engine ran at an effective 0.20 for its
+    # whole life, so jumping straight to the 0.5 this file always declared would
+    # silence the bot on questions it currently answers correctly. 0.35 is a
+    # staging post: raise it toward 0.5 while watching real conversations, using
+    # the env var so no deploy is needed to adjust it.
+    MIN_CONFIDENCE_THRESHOLD: float = float(os.getenv("MIN_CONFIDENCE_THRESHOLD", "0.35"))
 
     # Laravel API URL for query execution
     LARAVEL_API_URL: str = os.getenv("LARAVEL_API_URL", "http://localhost:8000")

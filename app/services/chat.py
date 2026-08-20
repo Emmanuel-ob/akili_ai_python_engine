@@ -10,6 +10,7 @@ from app.services.sql_validator import SQLValidator
 from app.services.sql_executor import DirectSQLExecutor
 from app.services.config_cache import ConfigCache
 from app.services.response_sanitizer import ResponseSanitizer
+from app.services.retrieval_gate import gate_and_order
 from app.services.insight_engine import get_recent_insights_summary  # Point 5A
 from app.core.config import settings
 from app.core.logging_config import logger
@@ -624,17 +625,15 @@ class ChatService:
         results = self.vectorstore.search_similar(
             collection_name=collection_name,
             query_vector=query_embedding,
-            limit=5,
+            limit=settings.DEFAULT_SEARCH_LIMIT,
             business_id=business_id,
             chatbot_id=chatbot_id,
             source_type_filter=source_filter,
         )
 
-        if not results:
-            return []
-
-        # Filter by minimum confidence
-        return [r for r in results if r.score >= 0.20]
+        # Relevance floor and priority ordering both live in retrieval_gate, so
+        # this path and _search_faq can never drift apart again.
+        return gate_and_order(results, threshold=settings.MIN_CONFIDENCE_THRESHOLD)
 
     async def _search_faq(
         self,
@@ -650,23 +649,25 @@ class ChatService:
         search_results = self.vectorstore.search_similar(
             collection_name=collection_name,
             query_vector=query_embedding,
-            limit=5,
+            limit=settings.DEFAULT_SEARCH_LIMIT,
             business_id=business_id,
             chatbot_id=chatbot_id,
             source_type_filter="faq",
         )
 
-        if not search_results:
-            return None
-
-        search_results.sort(
-            key=lambda x: x.payload.get("metadata", {}).get("faq_priority", 5),
-            reverse=True,
+        # Gate on relevance FIRST, then order by admin priority among the
+        # survivors. The reverse used to be true: everything was sorted by
+        # priority and only the first item was score-checked, so a pinned but
+        # irrelevant chunk became both the gate and the answer.
+        search_results = gate_and_order(
+            search_results, threshold=settings.MIN_CONFIDENCE_THRESHOLD
         )
 
-        top_result = search_results[0]
-        if top_result.score < 0.20:
-            logger.info(f"FAQ confidence too low: {top_result.score}")
+        if not search_results:
+            logger.info(
+                f"No FAQ chunk cleared the relevance floor "
+                f"({settings.MIN_CONFIDENCE_THRESHOLD})"
+            )
             return None
 
         context_texts = []
