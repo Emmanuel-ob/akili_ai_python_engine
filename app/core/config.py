@@ -59,6 +59,26 @@ class Settings:
     TEMPERATURE_GROUNDED: float = float(os.getenv("TEMPERATURE_GROUNDED", "0.1"))
     TEMPERATURE_CONVERSATIONAL: float = float(os.getenv("TEMPERATURE_CONVERSATIONAL", "0.7"))
 
+    # ── Intent router (Engine Revamp Phase 3) ────────────────────────────
+    # Replaces substring keyword matching for handover detection and query
+    # routing. Disable to fall back to FAQ-only routing with no automatic
+    # handover, which is degraded but safe.
+    INTENT_ROUTER_ENABLED: bool = os.getenv("INTENT_ROUTER_ENABLED", "true").lower() == "true"
+
+    # Same model family as generation. Nova Lite handles tool-use well and is
+    # already proven on this account by Trivia's voice router.
+    INTENT_ROUTER_MODEL: str = os.getenv("INTENT_ROUTER_MODEL", "amazon.nova-lite-v1:0")
+
+    # Below this confidence we do NOT act on the intent. Handover is the
+    # sensitive case: wrongly ejecting a customer to a human queue is worse
+    # than answering them, so an uncertain handover is treated as no handover.
+    INTENT_CONFIDENCE_THRESHOLD: float = float(os.getenv("INTENT_CONFIDENCE_THRESHOLD", "0.7"))
+
+    # The router runs before every answer, so its latency sits on the critical
+    # path. Short timeout; on expiry we degrade rather than make the customer
+    # wait twice.
+    INTENT_TIMEOUT_SECONDS: float = float(os.getenv("INTENT_TIMEOUT_SECONDS", "6"))
+
     # Rate Limiting Config
     GEMINI_RATE_LIMIT: int = int(os.getenv("GEMINI_RATE_LIMIT", "14"))
     RATE_LIMIT_WINDOW: int = 60
