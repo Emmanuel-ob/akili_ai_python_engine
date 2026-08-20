@@ -6,6 +6,7 @@ from app.core.config import settings
 from app.core.logging_config import logger
 from app.services.rate_limiter import rate_limiter
 from app.services.llm_provider import choose_provider, generate_bedrock
+import asyncio
 import re
 import json
 
@@ -446,23 +447,34 @@ Speak as if you just know the answer."""
 
         if provider == "bedrock":
             try:
-                return await self._generate_with_bedrock(messages, temperature)
+                return await self._to_thread(self._generate_with_bedrock, messages, temperature)
             except Exception as e:
                 logger.warning(f"Bedrock failed, falling back to Groq: {str(e)}")
-                return await self._generate_with_groq(messages, temperature)
+                return await self._to_thread(self._generate_with_groq, messages, temperature)
 
         if provider == "groq":
-            return await self._generate_with_groq(messages, temperature)
+            return await self._to_thread(self._generate_with_groq, messages, temperature)
 
         try:
-            reply = await self._generate_with_gemini(messages, temperature)
+            reply = await self._to_thread(self._generate_with_gemini, messages, temperature)
             self.rate_limiter.add_request("gemini")
             return reply
         except Exception as e:
             logger.warning(f"Gemini failed, falling back to Groq: {str(e)}")
-            return await self._generate_with_groq(messages, temperature)
+            return await self._to_thread(self._generate_with_groq, messages, temperature)
 
-    async def _generate_with_bedrock(
+    async def _to_thread(self, fn, *args):
+        """Run a blocking SDK call off the event loop.
+
+        Every provider SDK here is synchronous: boto3, google.genai and groq
+        all block. Awaiting them directly inside a coroutine stalls the whole
+        worker for the duration of the call, so concurrent chats serialise
+        behind each other. This is the same threadpool discipline Trivia's
+        voice intent router uses for exactly this reason.
+        """
+        return await asyncio.get_running_loop().run_in_executor(None, fn, *args)
+
+    def _generate_with_bedrock(
         self, messages: List[dict], temperature: float
     ) -> str:
         try:
@@ -476,7 +488,7 @@ Speak as if you just know the answer."""
             logger.error(f"Bedrock generation failed: {str(e)}")
             raise
 
-    async def _generate_with_gemini(
+    def _generate_with_gemini(
         self, messages: List[dict], temperature: float
     ) -> str:
         try:
@@ -491,7 +503,7 @@ Speak as if you just know the answer."""
             logger.error(f"Gemini generation failed: {str(e)}")
             raise
 
-    async def _generate_with_groq(
+    def _generate_with_groq(
         self, messages: List[dict], temperature: float
     ) -> str:
         try:
