@@ -1,4 +1,6 @@
 import os
+from urllib.parse import quote
+
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -26,7 +28,29 @@ class Settings:
 
     @property
     def POSTGRES_URL(self) -> str:
-        return f"postgresql://{self.POSTGRES_USER}:{self.POSTGRES_PASSWORD}@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        """Connection URL with credentials percent-encoded.
+
+        The user and password are URL components, so any character with
+        meaning in a URL has to be escaped. An unescaped '@' in a password
+        terminates the userinfo section early and the rest is parsed as the
+        host, producing errors like:
+
+            could not translate host name "!2026@localhost" to address
+
+        quote() with an empty safe list escapes '@', ':', '/', '?', '#' and
+        the rest, so a password containing any of them still round-trips.
+
+        Note that nothing in the engine uses this today: VectorStoreService
+        passes keyword arguments to psycopg2 instead, which needs no escaping
+        at all and is the safer habit. This property is kept correct for
+        tooling that expects a DSN.
+        """
+        user = quote(self.POSTGRES_USER, safe="")
+        password = quote(self.POSTGRES_PASSWORD, safe="")
+        return (
+            f"postgresql://{user}:{password}"
+            f"@{self.POSTGRES_HOST}:{self.POSTGRES_PORT}/{self.POSTGRES_DB}"
+        )
 
     # Embedding Config
     EMBEDDING_MODEL: str = os.getenv("EMBEDDING_MODEL", "gemini-embedding-001")
