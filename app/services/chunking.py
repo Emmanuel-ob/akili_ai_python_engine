@@ -29,6 +29,14 @@ from typing import Any, Dict, List, Optional
 from app.core.config import settings
 from app.core.logging_config import logger
 
+# Bumped whenever the chunking algorithm changes in a way that makes existing
+# chunk boundaries stale. Stored on every embedded row so a re-embed can skip
+# what is already current, which is what makes an interrupted run resumable.
+#
+#   1  fixed-width 500-character windows with 50-character overlap
+#   2  paragraph-first, sentence fallback, fragment coalescing
+CHUNKER_VERSION = 2
+
 
 def _split_to_ceiling(text: str, chunk_size: int) -> List[str]:
     """Split text into pieces no longer than chunk_size.

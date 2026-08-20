@@ -2,7 +2,7 @@ from fastapi import APIRouter, HTTPException, Depends, Header
 from app.schemas.embedding import UpsertRequest, UpsertResponse
 from app.services.embeddings import EmbeddingService
 from app.services.vectorstore import VectorStoreService
-from app.services.chunking import ChunkingService
+from app.services.chunking import CHUNKER_VERSION, ChunkingService
 from app.core.config import settings
 from app.core.logging_config import logger
 
@@ -116,6 +116,24 @@ async def upsert_embeddings(request: UpsertRequest, _: bool = Depends(verify_api
                     continue
 
                 # Step 3: Store in vector database
+                #
+                # Record which provider, model and chunker produced this row.
+                # Vectors from two different embedding models are not
+                # comparable, so without provenance a mixed collection
+                # degrades silently with nothing to diagnose it from. The
+                # chunker version is also what makes a re-embed resumable: a
+                # row already at the current version can be skipped.
+                doc.setdefault("metadata", {})
+                doc["metadata"].update(
+                    {
+                        **{
+                            f"embedding_{k}": v
+                            for k, v in embedding_service.get_provider_info().items()
+                        },
+                        "chunker_version": CHUNKER_VERSION,
+                    }
+                )
+
                 try:
                     count = vectorstore_service.upsert_documents(
                         collection_name=collection_name,
