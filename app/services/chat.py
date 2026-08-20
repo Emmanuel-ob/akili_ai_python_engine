@@ -478,24 +478,34 @@ class ChatService:
             chatbot_config.get("business_overview", ""),
         )
 
-        combined_parts = []
-        if sql_response and sql_response.text:
-            combined_parts.append(sql_response.text)
+        sql_text = sql_response.text if sql_response else ""
+        faq_text = faq_response.text if faq_response else ""
 
-        if faq_response and faq_response.text:
-            if user_type == "internal":
-                combined_parts.append(
-                    "\n\n---\n**Additional context from knowledge base:**"
-                )
-            else:
-                combined_parts.append("\n\nAdditional information:")
-            combined_parts.append(faq_response.text)
-
-        combined_text = (
-            "\n".join(combined_parts)
-            if combined_parts
-            else "I couldn't find relevant information."
-        )
+        if sql_text and faq_text:
+            # One model writes one answer. These used to be generated
+            # separately and stapled together under "Additional information:",
+            # which read as two different bots answering in turn, repeating
+            # themselves and sometimes contradicting each other.
+            combined_text = await self.llm.generate_response(
+                message=(
+                    "Answer the customer's question using both sources below. "
+                    "Write ONE natural reply in a single voice. Do not label "
+                    "the sources, do not mention that there were two of them, "
+                    "and do not repeat the same fact twice.\n\n"
+                    f"Customer asked: {message}\n\n"
+                    f"From their business records:\n{sql_text}\n\n"
+                    f"From the knowledge base:\n{faq_text}"
+                ),
+                context=[],
+                history="",
+                personality="helpful and professional",
+                business_overview=chatbot_config.get("business_overview", ""),
+            )
+        else:
+            # Only one source produced anything, so there is nothing to merge.
+            combined_text = (
+                sql_text or faq_text or "I couldn't find relevant information."
+            )
 
         all_sources = sql_response.sources.copy()
         if faq_response:
