@@ -466,6 +466,17 @@ class VectorStoreService:
             logger.error(f"Error deleting document: {str(e)}")
             return False
 
+    @staticmethod
+    def chunk_pattern_for(doc_id: str) -> str:
+        """Build a LIKE pattern matching every chunk of one source document.
+
+        Chunk ids are positional: "{doc_id}_chunk_{i}". Underscores and
+        percent signs inside the doc_id itself are escaped with '!' so they
+        are matched literally rather than as wildcards.
+        """
+        escaped = doc_id.replace("!", "!!").replace("_", "!_").replace("%", "!%")
+        return f"{escaped}!_chunk!_%"
+
     def delete_by_pattern(self, doc_id_pattern: str) -> int:
         """
         Generic method to delete documents by doc_id pattern
@@ -485,8 +496,14 @@ class VectorStoreService:
             conn = self._get_connection()
             cursor = conn.cursor()
 
+            # ESCAPE '!' so a literal underscore in a doc_id is not treated as
+            # a single-character wildcard. Real ids look like
+            # "<biz>:<bot>:my_portfolio.users:1_chunk_0", so unescaped they
+            # would also match "myXportfolio..." and delete another
+            # document's chunks.
             cursor.execute(
-                "DELETE FROM embeddings WHERE doc_id LIKE %s", (doc_id_pattern,)
+                "DELETE FROM embeddings WHERE doc_id LIKE %s ESCAPE '!'",
+                (doc_id_pattern,),
             )
 
             deleted_count = cursor.rowcount

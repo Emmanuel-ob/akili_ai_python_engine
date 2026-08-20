@@ -40,6 +40,27 @@ async def upsert_embeddings(request: UpsertRequest, _: bool = Depends(verify_api
         # Convert Pydantic models to dictionaries for processing
         documents = [doc.dict() for doc in request.docs]
 
+        # Clear each source document's previous chunks BEFORE writing the new
+        # ones. Chunk ids are positional ("{doc_id}_chunk_{i}") and the upsert
+        # keys on doc_id, so re-chunking a document into FEWER pieces leaves
+        # the surplus behind, still searchable. Structure-aware chunking
+        # produces fewer chunks than the old fixed-width slicing on most
+        # prose, so without this every re-ingest would leave mid-word
+        # fragments of the old scheme competing with the new chunks.
+        for source_doc_id in {d.get("doc_id") for d in documents if d.get("doc_id")}:
+            try:
+                removed = vectorstore_service.delete_by_pattern(
+                    VectorStoreService.chunk_pattern_for(source_doc_id)
+                )
+                if removed:
+                    logger.info(
+                        f"Cleared {removed} previous chunk(s) for {source_doc_id}"
+                    )
+            except Exception as e:
+                # Hard Rule 8: a cleanup failure must not abort the ingest.
+                # Worst case is the orphan behaviour we had before.
+                logger.error(f"Chunk cleanup failed for {source_doc_id}: {e}")
+
         # Optional: Chunk documents if they're too long
         chunked_documents = chunking_service.chunk_documents(documents)
         logger.info(f"After chunking: {len(chunked_documents)} total documents")
