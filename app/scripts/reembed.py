@@ -70,6 +70,13 @@ def already_current(chunks: List[Tuple]) -> bool:
 def main() -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--commit", action="store_true", help="write changes")
+    # Accepted and ignored: dry run is already the default, but the flag is
+    # the obvious thing to reach for and erroring on it would be hostile.
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="report what would change without writing (the default)",
+    )
     ap.add_argument("--business-id", help="limit to one business")
     ap.add_argument(
         "--force",
@@ -77,7 +84,9 @@ def main() -> int:
         help="re-embed even rows already at the current chunker version",
     )
     args = ap.parse_args()
-    writing = args.commit
+    # --commit wins if both are passed; the safe reading of an ambiguous
+    # invocation is the one that does not write.
+    writing = args.commit and not args.dry_run
 
     vectorstore = VectorStoreService()
     embedder = EmbeddingService()
