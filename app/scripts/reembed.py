@@ -128,9 +128,13 @@ def main() -> int:
             stats["after"] += len(new_chunks)
             delta = len(new_chunks) - len(chunks)
             print(
-                f"  {source_id[:70]:<70} {len(chunks):>3} -> {len(new_chunks):>3}"
+                f"  ...{source_id[-58:]:<58} {len(chunks):>3} -> {len(new_chunks):>3}"
                 f" ({delta:+d})"
             )
+
+            # Count before the dry-run short-circuit: a dry run that reports
+            # zero sources cannot tell you how much work it would do.
+            stats["rechunked"] += 1
 
             if not writing:
                 continue
@@ -176,7 +180,6 @@ def main() -> int:
                 payload,
             )
             conn.commit()
-            stats["rechunked"] += 1
 
         except Exception as exc:
             # One bad document must not stop the corpus.
