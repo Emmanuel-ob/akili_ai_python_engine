@@ -38,7 +38,12 @@ from psycopg2.extras import Json, execute_values
 
 from app.core.config import settings
 from app.core.logging_config import logger
-from app.services.chunk_ids import CHUNK_MARKER, group_by_source, source_id_of
+from app.services.chunk_ids import (
+    CHUNK_MARKER,
+    group_by_source,
+    reassemble,
+    source_id_of,
+)
 from app.services.chunking import CHUNKER_VERSION, ChunkingService
 from app.services.embeddings import EmbeddingService
 from app.services.vectorstore import VectorStoreService
@@ -116,7 +121,12 @@ def main() -> int:
             business_id = chunks[0][1]
             chatbot_id = chunks[0][2]
             metadata = dict(chunks[0][4] or {})
-            full_text = "\n\n".join(c[3] for c in chunks if c[3])
+            # Reassemble by removing the overlap the old chunker left between
+            # adjacent chunks. Joining with "\n\n" would insert a paragraph
+            # break exactly where it cut, often mid-word, and the new
+            # paragraph-first chunker would split there again: the old bad
+            # boundary would survive the re-embed and nothing would improve.
+            full_text = reassemble([c[3] for c in chunks])
 
             new_chunks = ChunkingService.chunk_text(full_text)
             if not new_chunks:

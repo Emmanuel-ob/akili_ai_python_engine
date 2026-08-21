@@ -41,6 +41,46 @@ def chunk_index_of(doc_id: str) -> int:
     return int(tail) if tail.isdigit() else 0
 
 
+# Below this length a shared region between two chunks is coincidence rather
+# than a real overlap, and removing it would delete genuine text.
+_MIN_OVERLAP = 8
+
+
+def reassemble(chunks: Sequence[str]) -> str:
+    """Rebuild a document's text from its stored chunks.
+
+    The old chunker produced fixed-width windows with CHUNK_OVERLAP characters
+    of overlap, so adjacent chunks share text. Two naive joins are both wrong:
+
+      "".join(...)      duplicates the shared region
+      "\\n\\n".join(...)  inserts a paragraph break exactly where the old
+                        chunker cut, often mid-word. The new paragraph-first
+                        chunker then splits there, so the old bad boundary
+                        survives the re-embed and nothing improves.
+
+    Instead, find the longest suffix of one chunk that is a prefix of the next
+    and drop the duplicate. Detecting the overlap rather than assuming
+    CHUNK_OVERLAP means this still works for documents chunked under a
+    different setting, which matters because the value is configurable.
+    """
+    parts = [c for c in chunks if c]
+    if not parts:
+        return ""
+
+    out = parts[0]
+    for nxt in parts[1:]:
+        limit = min(len(out), len(nxt))
+        overlap = 0
+        # Longest first: a short match inside a longer one is not the boundary.
+        for size in range(limit, _MIN_OVERLAP - 1, -1):
+            if out[-size:] == nxt[:size]:
+                overlap = size
+                break
+        out += nxt[overlap:]
+
+    return out
+
+
 def group_by_source(rows: Sequence[Tuple[Any, ...]]) -> Dict[str, List[Tuple]]:
     """Group chunk rows back into the documents they came from.
 
